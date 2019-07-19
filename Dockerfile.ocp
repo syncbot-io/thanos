@@ -1,0 +1,16 @@
+FROM registry.svc.ci.openshift.org/openshift/release:golang-1.12 AS builder
+WORKDIR /go/src/github.com/improbable-eng/thanos
+COPY . .
+RUN if yum install -y prometheus-promu; then export BUILD_PROMU=false; fi && make build
+
+FROM  registry.svc.ci.openshift.org/openshift/origin-v4.0:base
+LABEL io.k8s.display-name="OpenShift Thanos" \
+      io.k8s.description="Highly available Prometheus setup with long term storage capabilities." \
+      io.openshift.tags="prometheus,monitoring" \
+      maintainer="OpenShift Development <dev@lists.openshift.redhat.com>" \
+      version="v0.6.0"
+
+COPY --from=builder /go/src/github.com/improbable-eng/thanos/thanos /bin/thanos
+
+USER       nobody
+ENTRYPOINT [ "/bin/thanos" ]
