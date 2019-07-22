@@ -5,6 +5,9 @@ if grep "/vendor" .gitignore; then
 	exit 1
 fi
 
+set -e
+
+export GO111MODULE=on
 rm -rf vendor
 go mod vendor
 git diff --exit-code
