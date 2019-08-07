@@ -3,6 +3,7 @@ WORKDIR /go/src/github.com/improbable-eng/thanos
 COPY . .
 ENV GOFLAGS="-mod=vendor"
 ENV GO111MODULE=on
+ENV GOPROXY=direct
 RUN if yum install -y prometheus-promu; then export PROMU=/usr/bin/promu; fi && make build
 
 FROM  registry.svc.ci.openshift.org/openshift/origin-v4.0:base
