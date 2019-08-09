@@ -106,7 +106,7 @@ assets: $(GOBINDATA)
 
 # build builds Thanos binary using `promu`.
 .PHONY: build
-build: check-git  go-mod-tidy $(PROMU)
+build: check-git $(PROMU)
 	@echo ">> building binaries $(GOBIN)"
 	@$(PROMU) build --prefix $(PREFIX)
 
