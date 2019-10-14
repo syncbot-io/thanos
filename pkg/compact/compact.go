@@ -16,9 +16,11 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/tsdb"
-	terrors "github.com/prometheus/tsdb/errors"
-	"github.com/prometheus/tsdb/labels"
+	promlables "github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/tsdb"
+	terrors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
@@ -50,6 +52,7 @@ type Syncer struct {
 	blockSyncConcurrency int
 	metrics              *syncerMetrics
 	acceptMalformedIndex bool
+	relabelConfig        []*relabel.Config
 }
 
 type syncerMetrics struct {
@@ -64,13 +67,19 @@ type syncerMetrics struct {
 	compactionFailures        *prometheus.CounterVec
 }
 
+const (
+	MetricSyncMetaName = "thanos_compact_sync_meta_total"
+	MetricSyncMetaHelp = "Total number of sync meta operations."
+)
+
 func newSyncerMetrics(reg prometheus.Registerer) *syncerMetrics {
 	var m syncerMetrics
 
 	m.syncMetas = prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "thanos_compact_sync_meta_total",
-		Help: "Total number of sync meta operations.",
+		Name: MetricSyncMetaName,
+		Help: MetricSyncMetaHelp,
 	})
+
 	m.syncMetaFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "thanos_compact_sync_meta_failures_total",
 		Help: "Total number of failed sync meta operations.",
@@ -131,7 +140,7 @@ func newSyncerMetrics(reg prometheus.Registerer) *syncerMetrics {
 
 // NewSyncer returns a new Syncer for the given Bucket and directory.
 // Blocks must be at least as old as the sync delay for being considered.
-func NewSyncer(logger log.Logger, reg prometheus.Registerer, bkt objstore.Bucket, consistencyDelay time.Duration, blockSyncConcurrency int, acceptMalformedIndex bool) (*Syncer, error) {
+func NewSyncer(logger log.Logger, reg prometheus.Registerer, bkt objstore.Bucket, consistencyDelay time.Duration, blockSyncConcurrency int, acceptMalformedIndex bool, relabelConfig []*relabel.Config) (*Syncer, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
@@ -144,6 +153,7 @@ func NewSyncer(logger log.Logger, reg prometheus.Registerer, bkt objstore.Bucket
 		metrics:              newSyncerMetrics(reg),
 		blockSyncConcurrency: blockSyncConcurrency,
 		acceptMalformedIndex: acceptMalformedIndex,
+		relabelConfig:        relabelConfig,
 	}, nil
 }
 
@@ -162,8 +172,23 @@ func (c *Syncer) SyncMetas(ctx context.Context) error {
 	}
 	c.metrics.syncMetas.Inc()
 	c.metrics.syncMetaDuration.Observe(time.Since(begin).Seconds())
-
 	return err
+}
+
+// UntilNextDownsampling calculates how long it will take until the next downsampling operation.
+// Returns an error if there will be no downsampling.
+func UntilNextDownsampling(m *metadata.Meta) (time.Duration, error) {
+	timeRange := time.Duration((m.MaxTime - m.MinTime) * int64(time.Millisecond))
+	switch m.Thanos.Downsample.Resolution {
+	case downsample.ResLevel2:
+		return time.Duration(0), errors.New("no downsampling")
+	case downsample.ResLevel1:
+		return time.Duration(downsample.DownsampleRange1*time.Millisecond) - timeRange, nil
+	case downsample.ResLevel0:
+		return time.Duration(downsample.DownsampleRange0*time.Millisecond) - timeRange, nil
+	default:
+		panic(fmt.Errorf("invalid resolution %v", m.Thanos.Downsample.Resolution))
+	}
 }
 
 func (c *Syncer) syncMetas(ctx context.Context) error {
@@ -193,12 +218,22 @@ func (c *Syncer) syncMetas(ctx context.Context) error {
 				if err == blockTooFreshSentinelError {
 					continue
 				}
+
 				if err != nil {
 					if removedOrIgnored := c.removeIfMetaMalformed(workCtx, id); removedOrIgnored {
 						continue
 					}
 					errChan <- err
 					return
+				}
+
+				// Check for block labels by relabeling.
+				// If output is empty, the block will be dropped.
+				lset := promlables.FromMap(meta.Thanos.Labels)
+				processedLabels := relabel.Process(lset, c.relabelConfig...)
+				if processedLabels == nil {
+					level.Debug(c.logger).Log("msg", "dropping block(drop in relabeling)", "block", id)
+					continue
 				}
 
 				c.blocksMtx.Lock()
@@ -265,7 +300,7 @@ func (c *Syncer) downloadMeta(ctx context.Context, id ulid.ULID) (*metadata.Meta
 	// - repair created blocks
 	// - compactor created blocks
 	// NOTE: It is not safe to miss "old" block (even that it is newly created) in sync step. Compactor needs to aware of ALL old blocks.
-	// TODO(bplotka): https://github.com/thanos-io/thanos/issues/377
+	// TODO(bplotka): https://github.com/thanos-io/thanos/issues/377.
 	if ulid.Now()-id.Time() < uint64(c.consistencyDelay/time.Millisecond) &&
 		meta.Thanos.Source != metadata.BucketRepairSource &&
 		meta.Thanos.Source != metadata.CompactorSource &&
@@ -292,11 +327,11 @@ func (c *Syncer) removeIfMetaMalformed(ctx context.Context, id ulid.ULID) (remov
 	}
 
 	if ulid.Now()-id.Time() <= uint64(MinimumAgeForRemoval/time.Millisecond) {
-		// Minimum delay has not expired, ignore for now
+		// Minimum delay has not expired, ignore for now.
 		return true
 	}
 
-	if err := block.Delete(ctx, c.bkt, id); err != nil {
+	if err := block.Delete(ctx, c.logger, c.bkt, id); err != nil {
 		level.Warn(c.logger).Log("msg", "failed to delete malformed block", "block", id, "err", err)
 		return false
 	}
@@ -453,14 +488,14 @@ func (c *Syncer) garbageCollect(ctx context.Context, resolution int64) error {
 
 		level.Info(c.logger).Log("msg", "deleting outdated block", "block", id)
 
-		err := block.Delete(delCtx, c.bkt, id)
+		err := block.Delete(delCtx, c.logger, c.bkt, id)
 		cancel()
 		if err != nil {
 			return retry(errors.Wrapf(err, "delete block %s from bucket", id))
 		}
 
 		// Immediately update our in-memory state so no further call to SyncMetas is needed
-		/// after running garbage collection.
+		// after running garbage collection.
 		delete(c.blocks, id)
 		c.metrics.garbageCollectedBlocks.Inc()
 	}
@@ -589,7 +624,7 @@ func (e Issue347Error) Error() string {
 	return e.err.Error()
 }
 
-// Issue347Error returns true if the base error is a Issue347Error.
+// IsIssue347Error returns true if the base error is a Issue347Error.
 func IsIssue347Error(err error) bool {
 	_, ok := errors.Cause(err).(Issue347Error)
 	return ok
@@ -743,7 +778,7 @@ func RepairIssue347(ctx context.Context, logger log.Logger, bkt objstore.Bucket,
 	defer cancel()
 
 	// TODO(bplotka): Issue with this will introduce overlap that will halt compactor. Automate that (fix duplicate overlaps caused by this).
-	if err := block.Delete(delCtx, bkt, ie.id); err != nil {
+	if err := block.Delete(delCtx, logger, bkt, ie.id); err != nil {
 		return errors.Wrapf(err, "deleting old block %s failed. You need to delete this block manually", ie.id)
 	}
 
@@ -861,7 +896,7 @@ func (cg *Group) compact(ctx context.Context, dir string, comp tsdb.Compactor) (
 				}
 			}
 		}
-		// Even though this block was empty, there may be more work to do
+		// Even though this block was empty, there may be more work to do.
 		return true, ulid.ULID{}, nil
 	}
 	level.Debug(cg.logger).Log("msg", "compacted blocks",
@@ -932,7 +967,7 @@ func (cg *Group) deleteBlock(b string) error {
 	delCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	level.Info(cg.logger).Log("msg", "deleting compacted block", "old_block", id)
-	if err := block.Delete(delCtx, cg.bkt, id); err != nil {
+	if err := block.Delete(delCtx, cg.logger, cg.bkt, id); err != nil {
 		return errors.Wrapf(err, "delete block %s from bucket", id)
 	}
 	return nil
@@ -958,7 +993,7 @@ func NewBucketCompactor(
 	concurrency int,
 ) (*BucketCompactor, error) {
 	if concurrency <= 0 {
-		return nil, errors.New("invalid concurrency level (%d), concurrency level must be > 0")
+		return nil, errors.Errorf("invalid concurrency level (%d), concurrency level must be > 0", concurrency)
 	}
 	return &BucketCompactor{
 		logger:      logger,
@@ -972,6 +1007,11 @@ func NewBucketCompactor(
 
 // Compact runs compaction over bucket.
 func (c *BucketCompactor) Compact(ctx context.Context) error {
+	defer func() {
+		if err := os.RemoveAll(c.compactDir); err != nil {
+			level.Error(c.logger).Log("msg", "failed to remove compaction cache directory", "path", c.compactDir, "err", err)
+		}
+	}()
 	// Loop over bucket and compact until there's no work left.
 	for {
 		var (

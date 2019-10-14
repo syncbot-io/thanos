@@ -14,16 +14,16 @@ import (
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 
-	"github.com/prometheus/tsdb/fileutil"
+	"github.com/prometheus/prometheus/tsdb/fileutil"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
-	"github.com/prometheus/tsdb"
-	"github.com/prometheus/tsdb/chunks"
-	"github.com/prometheus/tsdb/index"
-	"github.com/prometheus/tsdb/labels"
+	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
@@ -175,7 +175,7 @@ func WriteIndexCache(logger log.Logger, indexFn string, fn string) error {
 // ReadIndexCache reads an index cache file.
 func ReadIndexCache(logger log.Logger, fn string) (
 	version int,
-	symbols map[uint32]string,
+	symbols []string,
 	lvals map[string][]string,
 	postings map[labels.Label]index.Range,
 	err error,
@@ -201,6 +201,14 @@ func ReadIndexCache(logger log.Logger, fn string) (
 	lvals = make(map[string][]string, len(v.LabelValues))
 	postings = make(map[labels.Label]index.Range, len(v.Postings))
 
+	var maxSymbolID uint32
+	for o := range v.Symbols {
+		if o > maxSymbolID {
+			maxSymbolID = o
+		}
+	}
+	symbols = make([]string, maxSymbolID+1)
+
 	// Most strings we encounter are duplicates. Dedup string objects that we keep
 	// around after the function returns to reduce total memory usage.
 	// NOTE(fabxc): it could even make sense to deduplicate globally.
@@ -213,7 +221,7 @@ func ReadIndexCache(logger log.Logger, fn string) (
 	}
 
 	for o, s := range v.Symbols {
-		v.Symbols[o] = getStr(s)
+		symbols[o] = getStr(s)
 	}
 	for ln, vals := range v.LabelValues {
 		for i := range vals {
@@ -228,7 +236,7 @@ func ReadIndexCache(logger log.Logger, fn string) (
 		}
 		postings[l] = index.Range{Start: e.Start, End: e.End}
 	}
-	return v.Version, v.Symbols, lvals, postings, nil
+	return v.Version, symbols, lvals, postings, nil
 }
 
 // VerifyIndex does a full run over a block index and verifies that it fulfills the order invariants.
@@ -247,7 +255,7 @@ type Stats struct {
 	// OutOfOrderSeries represents number of series that have out of order chunks.
 	OutOfOrderSeries int
 
-	// OutOfOrderChunks represents number of chunks that are out of order (older time range is after younger one)
+	// OutOfOrderChunks represents number of chunks that are out of order (older time range is after younger one).
 	OutOfOrderChunks int
 	// DuplicatedChunks represents number of chunks with same time ranges within same series, potential duplicates.
 	DuplicatedChunks int
@@ -446,7 +454,7 @@ type ignoreFnType func(mint, maxt int64, prev *chunks.Meta, curr *chunks.Meta) (
 // - all "complete" outsiders (they will not accessed anyway)
 // - removes all near "complete" outside chunks introduced by https://github.com/prometheus/tsdb/issues/347.
 // Fixable inconsistencies are resolved in the new block.
-// TODO(bplotka): https://github.com/thanos-io/thanos/issues/378
+// TODO(bplotka): https://github.com/thanos-io/thanos/issues/378.
 func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceType, ignoreChkFns ...ignoreFnType) (resid ulid.ULID, err error) {
 	if len(ignoreChkFns) == 0 {
 		return resid, errors.New("no ignore chunk function specified")
@@ -500,8 +508,8 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 	// that has multiple.
 	resmeta := *meta
 	resmeta.ULID = resid
-	resmeta.Stats = tsdb.BlockStats{} // reset stats
-	resmeta.Thanos.Source = source    // update source
+	resmeta.Stats = tsdb.BlockStats{} // Reset stats.
+	resmeta.Thanos.Source = source    // Update source.
 
 	if err := rewrite(logger, indexr, chunkr, indexw, chunkw, &resmeta, ignoreChkFns); err != nil {
 		return resid, errors.Wrap(err, "rewrite block")
@@ -510,8 +518,7 @@ func Repair(logger log.Logger, dir string, id ulid.ULID, source metadata.SourceT
 		return resid, err
 	}
 	// TSDB may rewrite metadata in bdir.
-	// TODO: This is not needed in newer TSDB code. See
-	// https://github.com/prometheus/tsdb/pull/637
+	// TODO: This is not needed in newer TSDB code. See https://github.com/prometheus/tsdb/pull/637.
 	if err := metadata.Write(logger, bdir, meta); err != nil {
 		return resid, err
 	}
