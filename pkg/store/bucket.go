@@ -22,16 +22,19 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/tsdb/chunks"
-	"github.com/prometheus/tsdb/fileutil"
-	"github.com/prometheus/tsdb/index"
-	"github.com/prometheus/tsdb/labels"
+	promlabels "github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/relabel"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/tsdb/fileutil"
+	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extprom"
+	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/pool"
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -43,13 +46,29 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// maxSamplesPerChunk is approximately the max number of samples that we may have in any given chunk. This is needed
-// for precalculating the number of samples that we may have to retrieve and decode for any given query
-// without downloading them. Please take a look at https://github.com/prometheus/tsdb/pull/397 to know
-// where this number comes from. Long story short: TSDB is made in such a way, and it is made in such a way
-// because you barely get any improvements in compression when the number of samples is beyond this.
-// Take a look at Figure 6 in this whitepaper http://www.vldb.org/pvldb/vol8/p1816-teller.pdf.
-const maxSamplesPerChunk = 120
+const (
+	// maxSamplesPerChunk is approximately the max number of samples that we may have in any given chunk. This is needed
+	// for precalculating the number of samples that we may have to retrieve and decode for any given query
+	// without downloading them. Please take a look at https://github.com/prometheus/tsdb/pull/397 to know
+	// where this number comes from. Long story short: TSDB is made in such a way, and it is made in such a way
+	// because you barely get any improvements in compression when the number of samples is beyond this.
+	// Take a look at Figure 6 in this whitepaper http://www.vldb.org/pvldb/vol8/p1816-teller.pdf.
+	maxSamplesPerChunk = 120
+
+	maxChunkSize = 16000
+
+	// CompatibilityTypeLabelName is an artificial label that Store Gateway can optionally advertise. This is required for compatibility
+	// with pre v0.8.0 Querier. Previous Queriers was strict about duplicated external labels of all StoreAPIs that had any labels.
+	// Now with newer Store Gateway advertising all the external labels it has access to, there was simple case where
+	// Querier was blocking Store Gateway as duplicate with sidecar.
+	//
+	// Newer Queriers are not strict, no duplicated external labels check is there anymore.
+	// Additionally newer Queriers removes/ignore this exact labels from UI and querying.
+	//
+	// This label name is intentionally against Prometheus label style.
+	// TODO(bwplotka): Remove it at some point.
+	CompatibilityTypeLabelName = "@thanos_compatibility_store_type"
+)
 
 type bucketStoreMetrics struct {
 	blocksLoaded          prometheus.Gauge
@@ -182,6 +201,11 @@ type indexCache interface {
 	Series(b ulid.ULID, id uint64) ([]byte, bool)
 }
 
+// FilterConfig is a configuration, which Store uses for filtering metrics.
+type FilterConfig struct {
+	MinTime, MaxTime model.TimeOrDurationValue
+}
+
 // BucketStore implements the store API backed by a bucket. It loads all index
 // files to local disk.
 type BucketStore struct {
@@ -208,6 +232,12 @@ type BucketStore struct {
 	// samplesLimiter limits the number of samples per each Series() call.
 	samplesLimiter *Limiter
 	partitioner    partitioner
+
+	filterConfig  *FilterConfig
+	relabelConfig []*relabel.Config
+
+	labelSets                map[uint64]labels.Labels
+	enableCompatibilityLabel bool
 }
 
 // NewBucketStore creates a new bucket backed store that implements the store API against
@@ -223,6 +253,9 @@ func NewBucketStore(
 	maxConcurrent int,
 	debugLogging bool,
 	blockSyncConcurrency int,
+	filterConf *FilterConfig,
+	relabelConfig []*relabel.Config,
+	enableCompatibilityLabel bool,
 ) (*BucketStore, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -232,7 +265,7 @@ func NewBucketStore(
 		return nil, errors.Errorf("max concurrency value cannot be lower than 0 (got %v)", maxConcurrent)
 	}
 
-	chunkPool, err := pool.NewBytesPool(2e5, 50e6, 2, maxChunkPoolBytes)
+	chunkPool, err := pool.NewBytesPool(maxChunkSize, 50e6, 2, maxChunkPoolBytes)
 	if err != nil {
 		return nil, errors.Wrap(err, "create chunk pool")
 	}
@@ -254,8 +287,11 @@ func NewBucketStore(
 			maxConcurrent,
 			extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg),
 		),
-		samplesLimiter: NewLimiter(maxSampleCount, metrics.queriesDropped),
-		partitioner:    gapBasedPartitioner{maxGapSize: maxGapSize},
+		samplesLimiter:           NewLimiter(maxSampleCount, metrics.queriesDropped),
+		partitioner:              gapBasedPartitioner{maxGapSize: maxGapSize},
+		filterConfig:             filterConf,
+		relabelConfig:            relabelConfig,
+		enableCompatibilityLabel: enableCompatibilityLabel,
 	}
 	s.metrics = metrics
 
@@ -309,6 +345,17 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		if err != nil {
 			return nil
 		}
+
+		inRange, err := s.isBlockInMinMaxRange(ctx, id)
+		if err != nil {
+			level.Warn(s.logger).Log("msg", "error parsing block range", "block", id, "err", err)
+			return nil
+		}
+
+		if !inRange {
+			return nil
+		}
+
 		allIDs[id] = struct{}{}
 
 		if b := s.getBlock(id); b != nil {
@@ -338,6 +385,14 @@ func (s *BucketStore) SyncBlocks(ctx context.Context) error {
 		}
 		s.metrics.blockDrops.Inc()
 	}
+
+	// Sync advertise labels.
+	s.mtx.Lock()
+	s.labelSets = make(map[uint64]labels.Labels, len(s.blocks))
+	for _, bs := range s.blocks {
+		s.labelSets[bs.labels.Hash()] = append(labels.Labels(nil), bs.labels...)
+	}
+	s.mtx.Unlock()
 
 	return nil
 }
@@ -377,6 +432,26 @@ func (s *BucketStore) numBlocks() int {
 	return len(s.blocks)
 }
 
+func (s *BucketStore) isBlockInMinMaxRange(ctx context.Context, id ulid.ULID) (bool, error) {
+	dir := filepath.Join(s.dir, id.String())
+
+	err, meta := loadMeta(ctx, s.logger, s.bucket, dir, id)
+	if err != nil {
+		return false, err
+	}
+
+	// We check for blocks in configured minTime, maxTime range.
+	switch {
+	case meta.MaxTime <= s.filterConfig.MinTime.PrometheusTimestamp():
+		return false, nil
+
+	case meta.MinTime >= s.filterConfig.MaxTime.PrometheusTimestamp():
+		return false, nil
+	}
+
+	return true, nil
+}
+
 func (s *BucketStore) getBlock(id ulid.ULID) *bucketBlock {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -414,6 +489,15 @@ func (s *BucketStore) addBlock(ctx context.Context, id ulid.ULID) (err error) {
 
 	lset := labels.FromMap(b.meta.Thanos.Labels)
 	h := lset.Hash()
+
+	// Check for block labels by relabeling.
+	// If output is empty, the block will be dropped.
+	if processedLabels := relabel.Process(promlabels.FromMap(lset.Map()), s.relabelConfig...); processedLabels == nil {
+		level.Debug(s.logger).Log("msg", "dropping block(drop in relabeling)", "block", id)
+		return os.RemoveAll(dir)
+	}
+	b.labels = lset
+	sort.Sort(b.labels)
 
 	set, ok := s.blockSets[h]
 	if !ok {
@@ -468,18 +552,59 @@ func (s *BucketStore) TimeRange() (mint, maxt int64) {
 			maxt = b.meta.MaxTime
 		}
 	}
+
+	mint = s.limitMinTime(mint)
+	maxt = s.limitMaxTime(maxt)
+
 	return mint, maxt
 }
 
 // Info implements the storepb.StoreServer interface.
 func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.InfoResponse, error) {
 	mint, maxt := s.TimeRange()
-	// Store nodes hold global data and thus have no labels.
-	return &storepb.InfoResponse{
+	res := &storepb.InfoResponse{
 		StoreType: component.Store.ToProto(),
 		MinTime:   mint,
 		MaxTime:   maxt,
-	}, nil
+	}
+
+	s.mtx.RLock()
+	res.LabelSets = make([]storepb.LabelSet, 0, len(s.labelSets))
+	for _, ls := range s.labelSets {
+		lset := make([]storepb.Label, 0, len(ls))
+		for _, l := range ls {
+			lset = append(lset, storepb.Label{Name: l.Name, Value: l.Value})
+		}
+		res.LabelSets = append(res.LabelSets, storepb.LabelSet{Labels: lset})
+	}
+	s.mtx.RUnlock()
+
+	if s.enableCompatibilityLabel && len(res.LabelSets) > 0 {
+		// This is for compatibility with Querier v0.7.0.
+		// See query.StoreCompatibilityTypeLabelName comment for details.
+		res.LabelSets = append(res.LabelSets, storepb.LabelSet{Labels: []storepb.Label{{Name: CompatibilityTypeLabelName, Value: "store"}}})
+	}
+	return res, nil
+}
+
+func (s *BucketStore) limitMinTime(mint int64) int64 {
+	filterMinTime := s.filterConfig.MinTime.PrometheusTimestamp()
+
+	if mint < filterMinTime {
+		return filterMinTime
+	}
+
+	return mint
+}
+
+func (s *BucketStore) limitMaxTime(maxt int64) int64 {
+	filterMaxTime := s.filterConfig.MaxTime.PrometheusTimestamp()
+
+	if maxt > filterMaxTime {
+		maxt = filterMaxTime
+	}
+
+	return maxt
 }
 
 type seriesEntry struct {
@@ -722,6 +847,9 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
+	req.MinTime = s.limitMinTime(req.MinTime)
+	req.MaxTime = s.limitMaxTime(req.MaxTime)
+
 	var (
 		stats = &queryStats{}
 		g     run.Group
@@ -930,12 +1058,12 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 }
 
 // bucketBlockSet holds all blocks of an equal label set. It internally splits
-// them up by downsampling resolution and allows querying
+// them up by downsampling resolution and allows querying.
 type bucketBlockSet struct {
 	labels      labels.Labels
 	mtx         sync.RWMutex
-	resolutions []int64          // available resolution, high to low (in milliseconds)
-	blocks      [][]*bucketBlock // ordered buckets for the existing resolutions
+	resolutions []int64          // Available resolution, high to low (in milliseconds).
+	blocks      [][]*bucketBlock // Ordered buckets for the existing resolutions.
 }
 
 // newBucketBlockSet initializes a new set with the known downsampling windows hard-configured.
@@ -1060,7 +1188,7 @@ type bucketBlock struct {
 	chunkPool  *pool.BytesPool
 
 	indexVersion int
-	symbols      map[uint32]string
+	symbols      []string
 	lvals        map[string][]string
 	postings     map[labels.Label]index.Range
 
@@ -1070,6 +1198,8 @@ type bucketBlock struct {
 	pendingReaders sync.WaitGroup
 
 	partitioner partitioner
+
+	labels labels.Labels
 }
 
 func newBucketBlock(
@@ -1091,9 +1221,12 @@ func newBucketBlock(
 		dir:         dir,
 		partitioner: p,
 	}
-	if err = b.loadMeta(ctx, id); err != nil {
+	err, meta := loadMeta(ctx, logger, bkt, dir, id)
+	if err != nil {
 		return nil, errors.Wrap(err, "load meta")
 	}
+	b.meta = meta
+
 	if err = b.loadIndexCacheFile(ctx); err != nil {
 		return nil, errors.Wrap(err, "load index cache")
 	}
@@ -1116,26 +1249,26 @@ func (b *bucketBlock) indexCacheFilename() string {
 	return path.Join(b.id.String(), block.IndexCacheFilename)
 }
 
-func (b *bucketBlock) loadMeta(ctx context.Context, id ulid.ULID) error {
-	// If we haven't seen the block before download the meta.json file.
-	if _, err := os.Stat(b.dir); os.IsNotExist(err) {
-		if err := os.MkdirAll(b.dir, 0777); err != nil {
-			return errors.Wrap(err, "create dir")
+func loadMeta(ctx context.Context, logger log.Logger, bucket objstore.BucketReader, dir string, id ulid.ULID) (error, *metadata.Meta) {
+	// If we haven't seen the block before or it is missing the meta.json, download it.
+	if _, err := os.Stat(path.Join(dir, block.MetaFilename)); os.IsNotExist(err) {
+		if err := os.MkdirAll(dir, 0777); err != nil {
+			return errors.Wrap(err, "create dir"), nil
 		}
 		src := path.Join(id.String(), block.MetaFilename)
 
-		if err := objstore.DownloadFile(ctx, b.logger, b.bucket, src, b.dir); err != nil {
-			return errors.Wrap(err, "download meta.json")
+		if err := objstore.DownloadFile(ctx, logger, bucket, src, dir); err != nil {
+			return errors.Wrap(err, "download meta.json"), nil
 		}
 	} else if err != nil {
-		return err
+		return err, nil
 	}
-	meta, err := metadata.Read(b.dir)
+	meta, err := metadata.Read(dir)
 	if err != nil {
-		return errors.Wrap(err, "read meta.json")
+		return errors.Wrap(err, "read meta.json"), nil
 	}
-	b.meta = meta
-	return nil
+
+	return nil, meta
 }
 
 func (b *bucketBlock) loadIndexCacheFile(ctx context.Context) (err error) {
@@ -1204,11 +1337,13 @@ func (b *bucketBlock) readChunkRange(ctx context.Context, seq int, off, length i
 
 	r, err := b.bucket.GetRange(ctx, b.chunkObjs[seq], off, length)
 	if err != nil {
+		b.chunkPool.Put(c)
 		return nil, errors.Wrap(err, "get range reader")
 	}
 	defer runutil.CloseWithLogOnErr(b.logger, r, "readChunkRange close range reader")
 
 	if _, err = io.Copy(buf, r); err != nil {
+		b.chunkPool.Put(c)
 		return nil, errors.Wrap(err, "read range")
 	}
 	internalBuf := buf.Bytes()
@@ -1231,8 +1366,7 @@ func (b *bucketBlock) Close() error {
 	return nil
 }
 
-// bucketIndexReader is a custom index reader (not conforming index.Reader interface) that gets postings
-// by
+// bucketIndexReader is a custom index reader (not conforming index.Reader interface) that gets postings.
 type bucketIndexReader struct {
 	logger log.Logger
 	ctx    context.Context
@@ -1260,11 +1394,12 @@ func newBucketIndexReader(ctx context.Context, logger log.Logger, block *bucketB
 }
 
 func (r *bucketIndexReader) lookupSymbol(o uint32) (string, error) {
-	s, ok := r.block.symbols[o]
-	if !ok {
+	idx := int(o)
+	if idx >= len(r.block.symbols) {
 		return "", errors.Errorf("bucketIndexReader: unknown symbol offset %d", o)
 	}
-	return s, nil
+
+	return r.block.symbols[idx], nil
 }
 
 // ExpandedPostings returns postings in expanded list instead of index.Postings.
@@ -1362,7 +1497,7 @@ func toPostingGroup(lvalsFn func(name string) []string, m labels.Matcher) *posti
 
 	// If the matcher selects an empty value, it selects all the series which don't
 	// have the label name set too. See: https://github.com/prometheus/prometheus/issues/3575
-	// and https://github.com/prometheus/prometheus/pull/3578#issuecomment-351653555
+	// and https://github.com/prometheus/prometheus/pull/3578#issuecomment-351653555.
 	if m.Matches("") {
 		allName, allValue := index.AllPostingsKey()
 
@@ -1694,8 +1829,6 @@ func (r *bucketChunkReader) addPreload(id uint64) error {
 
 // preload all added chunk IDs. Must be called before the first call to Chunk is made.
 func (r *bucketChunkReader) preload(samplesLimiter *Limiter) error {
-	const maxChunkSize = 16000
-
 	var g run.Group
 
 	numChunks := uint64(0)
@@ -1794,7 +1927,7 @@ func (b rawChunk) Bytes() []byte {
 	return b[1:]
 }
 
-func (b rawChunk) Iterator() chunkenc.Iterator {
+func (b rawChunk) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
 	panic("invalid call")
 }
 

@@ -8,31 +8,34 @@ import (
 	"sync"
 	"time"
 
+	"github.com/thanos-io/thanos/pkg/extflag"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/run"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/tsdb/labels"
+	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
+	thanosmodel "github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
+	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/reloader"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
-	"google.golang.org/grpc"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const waitForExternalLabelsTimeout = 10 * time.Minute
 
-func registerSidecar(m map[string]setupFunc, app *kingpin.Application, name string) {
-	cmd := app.Command(name, "sidecar for Prometheus server")
+func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
+	cmd := app.Command(component.Sidecar.String(), "sidecar for Prometheus server")
 
 	grpcBindAddr, httpBindAddr, cert, key, clientCA := regCommonServerFlags(cmd)
 
@@ -54,7 +57,10 @@ func registerSidecar(m map[string]setupFunc, app *kingpin.Application, name stri
 
 	uploadCompacted := cmd.Flag("shipper.upload-compacted", "[Experimental] If true sidecar will try to upload compacted blocks as well. Useful for migration purposes. Works only if compaction is disabled on Prometheus.").Default("false").Hidden().Bool()
 
-	m[name] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
+	minTime := thanosmodel.TimeOrDuration(cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
+		Default("0000-01-01T00:00:00Z"))
+
+	m[component.Sidecar.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
 		rl := reloader.New(
 			log.With(logger, "component", "reloader"),
 			reloader.ReloadURLFromBase(*promURL),
@@ -62,6 +68,7 @@ func registerSidecar(m map[string]setupFunc, app *kingpin.Application, name stri
 			*reloaderCfgOutputFile,
 			*reloaderRuleDirs,
 		)
+
 		return runSidecar(
 			g,
 			logger,
@@ -77,6 +84,8 @@ func registerSidecar(m map[string]setupFunc, app *kingpin.Application, name stri
 			objStoreConfig,
 			rl,
 			*uploadCompacted,
+			component.Sidecar,
+			*minTime,
 		)
 	}
 }
@@ -93,17 +102,21 @@ func runSidecar(
 	httpBindAddr string,
 	promURL *url.URL,
 	dataDir string,
-	objStoreConfig *pathOrContent,
+	objStoreConfig *extflag.PathOrContent,
 	reloader *reloader.Reloader,
 	uploadCompacted bool,
+	comp component.Component,
+	limitMinTime thanosmodel.TimeOrDurationValue,
 ) error {
 	var m = &promMetadata{
 		promURL: promURL,
 
 		// Start out with the full time range. The shipper will constrain it later.
 		// TODO(fabxc): minimum timestamp is never adjusted if shipping is disabled.
-		mint: 0,
+		mint: limitMinTime.PrometheusTimestamp(),
 		maxt: math.MaxInt64,
+
+		limitMinTime: limitMinTime,
 	}
 
 	confContentYaml, err := objStoreConfig.Content()
@@ -115,6 +128,12 @@ func runSidecar(
 	if len(confContentYaml) == 0 {
 		level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
 		uploads = false
+	}
+
+	statusProber := prober.NewProber(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
+	// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
+	if err := scheduleHTTPServer(g, logger, reg, statusProber, httpBindAddr, nil, comp); err != nil {
+		return errors.Wrap(err, "schedule HTTP server with probes")
 	}
 
 	// Setup all the concurrent groups.
@@ -148,6 +167,7 @@ func runSidecar(
 						"err", err,
 					)
 					promUp.Set(0)
+					statusProber.SetNotReady(err)
 					return err
 				}
 
@@ -156,6 +176,7 @@ func runSidecar(
 					"external_labels", m.Labels().String(),
 				)
 				promUp.Set(1)
+				statusProber.SetReady()
 				lastHeartbeat.Set(float64(time.Now().UnixNano()) / 1e9)
 				return nil
 			})
@@ -195,9 +216,7 @@ func runSidecar(
 			cancel()
 		})
 	}
-	if err := metricHTTPListenGroup(g, logger, reg, httpBindAddr); err != nil {
-		return err
-	}
+
 	{
 		l, err := net.Listen("tcp", grpcBindAddr)
 		if err != nil {
@@ -211,12 +230,11 @@ func runSidecar(
 			return errors.Wrap(err, "create Prometheus store")
 		}
 
-		opts, err := defaultGRPCServerOpts(logger, reg, tracer, cert, key, clientCA)
+		opts, err := defaultGRPCServerOpts(logger, cert, key, clientCA)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
-		s := grpc.NewServer(opts...)
-		storepb.RegisterStoreServer(s, promStore)
+		s := newStoreGRPCServer(logger, reg, tracer, promStore, opts)
 
 		g.Add(func() error {
 			level.Info(logger).Log("msg", "Listening for StoreAPI gRPC", "address", grpcBindAddr)
@@ -276,9 +294,9 @@ func runSidecar(
 				minTime, _, err := s.Timestamps()
 				if err != nil {
 					level.Warn(logger).Log("msg", "reading timestamps failed", "err", err)
-				} else {
-					m.UpdateTimestamps(minTime, math.MaxInt64)
+					return nil
 				}
+				m.UpdateTimestamps(minTime, math.MaxInt64)
 				return nil
 			})
 		}, func(error) {
@@ -332,6 +350,8 @@ type promMetadata struct {
 	mint   int64
 	maxt   int64
 	labels labels.Labels
+
+	limitMinTime thanosmodel.TimeOrDurationValue
 }
 
 func (s *promMetadata) UpdateLabels(ctx context.Context, logger log.Logger) error {
@@ -350,6 +370,10 @@ func (s *promMetadata) UpdateLabels(ctx context.Context, logger log.Logger) erro
 func (s *promMetadata) UpdateTimestamps(mint int64, maxt int64) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+
+	if mint < s.limitMinTime.PrometheusTimestamp() {
+		mint = s.limitMinTime.PrometheusTimestamp()
+	}
 
 	s.mint = mint
 	s.maxt = maxt

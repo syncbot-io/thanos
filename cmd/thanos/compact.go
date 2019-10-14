@@ -2,9 +2,7 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -12,13 +10,15 @@ import (
 	"strings"
 	"time"
 
+	"github.com/thanos-io/thanos/pkg/extflag"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
@@ -70,8 +70,7 @@ func (cs compactionSet) maxLevel() int {
 }
 
 func registerCompact(m map[string]setupFunc, app *kingpin.Application) {
-	comp := component.Compact
-	cmd := app.Command(comp.String(), "continuously compacts blocks in an object store bucket")
+	cmd := app.Command(component.Compact.String(), "continuously compacts blocks in an object store bucket")
 
 	haltOnError := cmd.Flag("debug.halt-on-error", "Halt the process if a critical compaction error is detected.").
 		Hidden().Default("true").Bool()
@@ -99,10 +98,9 @@ func registerCompact(m map[string]setupFunc, app *kingpin.Application) {
 	generateMissingIndexCacheFiles := cmd.Flag("index.generate-missing-cache-file", "If enabled, on startup compactor runs an on-off job that scans all the blocks to find all blocks with missing index cache file. It generates those if needed and upload.").
 		Hidden().Default("false").Bool()
 
-	// TODO(bplotka): Remove this flag once https://github.com/thanos-io/thanos/issues/297 is fixed.
-	disableDownsampling := cmd.Flag("debug.disable-downsampling", "Disables downsampling. This is not recommended "+
-		"as querying long time ranges without non-downsampled data is not efficient and not useful (is not possible to render all for human eye).").
-		Hidden().Default("false").Bool()
+	disableDownsampling := cmd.Flag("downsampling.disable", "Disables downsampling. This is not recommended "+
+		"as querying long time ranges without non-downsampled data is not efficient and useful e.g it is not possible to render all samples for a human eye anyway").
+		Default("false").Bool()
 
 	maxCompactionLevel := cmd.Flag("debug.max-compaction-level", fmt.Sprintf("Maximum compaction level, default is %d: %s", compactions.maxLevel(), compactions.String())).
 		Hidden().Default(strconv.Itoa(compactions.maxLevel())).Int()
@@ -113,7 +111,9 @@ func registerCompact(m map[string]setupFunc, app *kingpin.Application) {
 	compactionConcurrency := cmd.Flag("compact.concurrency", "Number of goroutines to use when compacting groups.").
 		Default("1").Int()
 
-	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
+	selectorRelabelConf := regSelectorRelabelFlags(cmd)
+
+	m[component.Compact.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
 		return runCompact(g, logger, reg,
 			*httpAddr,
 			*dataDir,
@@ -128,11 +128,12 @@ func registerCompact(m map[string]setupFunc, app *kingpin.Application) {
 				compact.ResolutionLevel5m:  time.Duration(*retention5m),
 				compact.ResolutionLevel1h:  time.Duration(*retention1h),
 			},
-			comp,
+			component.Compact,
 			*disableDownsampling,
 			*maxCompactionLevel,
 			*blockSyncConcurrency,
 			*compactionConcurrency,
+			selectorRelabelConf,
 		)
 	}
 }
@@ -143,7 +144,7 @@ func runCompact(
 	reg *prometheus.Registry,
 	httpBindAddr string,
 	dataDir string,
-	objStoreConfig *pathOrContent,
+	objStoreConfig *extflag.PathOrContent,
 	consistencyDelay time.Duration,
 	haltOnError bool,
 	acceptMalformedIndex bool,
@@ -155,6 +156,7 @@ func runCompact(
 	maxCompactionLevel int,
 	blockSyncConcurrency int,
 	concurrency int,
+	selectorRelabelConf *extflag.PathOrContent,
 ) error {
 	halted := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "thanos_compactor_halted",
@@ -171,10 +173,10 @@ func runCompact(
 
 	downsampleMetrics := newDownsampleMetrics(reg)
 
-	readinessProber := prober.NewProber(component, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
-	// Initiate default HTTP listener providing metrics endpoint and readiness/liveness probes.
-	if err := defaultHTTPListener(g, logger, reg, httpBindAddr, readinessProber); err != nil {
-		return errors.Wrap(err, "create readiness prober")
+	statusProber := prober.NewProber(component, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
+	// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
+	if err := scheduleHTTPServer(g, logger, reg, statusProber, httpBindAddr, nil, component); err != nil {
+		return errors.Wrap(err, "schedule HTTP server with probes")
 	}
 
 	confContentYaml, err := objStoreConfig.Content()
@@ -187,6 +189,16 @@ func runCompact(
 		return err
 	}
 
+	relabelContentYaml, err := selectorRelabelConf.Content()
+	if err != nil {
+		return errors.Wrap(err, "get content of relabel configuration")
+	}
+
+	relabelConfig, err := parseRelabelConfig(relabelContentYaml)
+	if err != nil {
+		return err
+	}
+
 	// Ensure we close up everything properly.
 	defer func() {
 		if err != nil {
@@ -195,7 +207,7 @@ func runCompact(
 	}()
 
 	sy, err := compact.NewSyncer(logger, reg, bkt, consistencyDelay,
-		blockSyncConcurrency, acceptMalformedIndex)
+		blockSyncConcurrency, acceptMalformedIndex, relabelConfig)
 	if err != nil {
 		return errors.Wrap(err, "create syncer")
 	}
@@ -210,7 +222,6 @@ func runCompact(
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-
 	// Instantiate the compactor with different time slices. Timestamps in TSDB
 	// are in milliseconds.
 	comp, err := tsdb.NewLeveledCompactor(ctx, reg, logger, levels, downsample.NewPool())
@@ -284,7 +295,7 @@ func runCompact(
 
 		// Generate index file.
 		if generateMissingIndexCacheFiles {
-			if err := genMissingIndexCacheFiles(ctx, logger, bkt, indexCacheDir); err != nil {
+			if err := genMissingIndexCacheFiles(ctx, logger, reg, bkt, indexCacheDir); err != nil {
 				return err
 			}
 		}
@@ -328,12 +339,23 @@ func runCompact(
 	})
 
 	level.Info(logger).Log("msg", "starting compact node")
-	readinessProber.SetReady()
+	statusProber.SetReady()
 	return nil
 }
 
+const (
+	MetricIndexGenerateName = "thanos_compact_generated_index_total"
+	MetricIndexGenerateHelp = "Total number of generated indexes."
+)
+
 // genMissingIndexCacheFiles scans over all blocks, generates missing index cache files and uploads them to object storage.
-func genMissingIndexCacheFiles(ctx context.Context, logger log.Logger, bkt objstore.Bucket, dir string) error {
+func genMissingIndexCacheFiles(ctx context.Context, logger log.Logger, reg *prometheus.Registry, bkt objstore.Bucket, dir string) error {
+	genIndex := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: MetricIndexGenerateName,
+		Help: MetricIndexGenerateHelp,
+	})
+	reg.MustRegister(genIndex)
+
 	if err := os.RemoveAll(dir); err != nil {
 		return errors.Wrap(err, "clean index cache directory")
 	}
@@ -357,26 +379,14 @@ func genMissingIndexCacheFiles(ctx context.Context, logger log.Logger, bkt objst
 			return nil
 		}
 
-		rc, err := bkt.Get(ctx, path.Join(id.String(), block.MetaFilename))
+		meta, err := block.DownloadMeta(ctx, logger, bkt, id)
 		if err != nil {
 			// Probably not finished block, skip it.
-			if bkt.IsObjNotFoundErr(err) {
+			if bkt.IsObjNotFoundErr(errors.Cause(err)) {
 				level.Warn(logger).Log("msg", "meta file wasn't found", "block", id.String())
 				return nil
 			}
-			return errors.Wrapf(err, "get meta for block %s", id)
-		}
-		defer runutil.CloseWithLogOnErr(logger, rc, "block reader")
-
-		var meta metadata.Meta
-
-		obj, err := ioutil.ReadAll(rc)
-		if err != nil {
-			return errors.Wrap(err, "read meta")
-		}
-
-		if err = json.Unmarshal(obj, &meta); err != nil {
-			return errors.Wrap(err, "unmarshal meta")
+			return errors.Wrap(err, "download metadata")
 		}
 
 		// New version of compactor pushes index cache along with data block.
@@ -396,6 +406,7 @@ func genMissingIndexCacheFiles(ctx context.Context, logger log.Logger, bkt objst
 		if err := generateIndexCacheFile(ctx, bkt, logger, dir, meta); err != nil {
 			return err
 		}
+		genIndex.Inc()
 	}
 
 	level.Info(logger).Log("msg", "generating index cache files is done, you can remove startup argument `index.generate-missing-cache-file`")
