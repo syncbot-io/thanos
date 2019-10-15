@@ -4,8 +4,13 @@ COPY . .
 ENV GOFLAGS="-mod=vendor"
 ENV GO111MODULE=on
 ENV GOPROXY=direct
-RUN if yum install -y prometheus-promu; then export PROMU=/usr/bin/promu; fi && make build
-
+RUN make check-git; \
+    if yum install -y prometheus-promu; then \
+        export PROMU=/usr/bin/promu; \
+        promu build; \
+    else \
+        make build; \
+    fi
 FROM  registry.svc.ci.openshift.org/openshift/origin-v4.0:base
 LABEL io.k8s.display-name="OpenShift Thanos" \
       io.k8s.description="Highly available Prometheus setup with long term storage capabilities." \
