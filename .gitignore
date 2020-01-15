@@ -2,6 +2,7 @@
 
 /prometheus
 /thanos
+/mixin/vendor/
 
 # Ignore minikube setup working dirs.
 kube/bin
@@ -24,3 +25,4 @@ website/docs-pre-processed/
 !website/data
 
 tmp/bin
+examples/tmp/

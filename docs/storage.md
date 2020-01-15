@@ -13,12 +13,12 @@ All clients are configured using `--objstore.config-file` to reference to the co
 
 ## How to use `config` flags?
 
-You can either pass YAML file defined below in `--objstore.config-file` or pass the YAML content directly using `--objstore.config`. 
+You can either pass YAML file defined below in `--objstore.config-file` or pass the YAML content directly using `--objstore.config`.
 We recommend the latter as it gives an explicit static view of configuration for each component. It also saves you the fuss of creating and managing additional file.
 
 Don't be afraid of multiline flags!
 
-In Kubernetes it is as easy as (on Thanos sidecar example)::
+In Kubernetes it is as easy as (on Thanos sidecar example):
 
 ```yaml
       - args:
@@ -49,17 +49,19 @@ In Kubernetes it is as easy as (on Thanos sidecar example)::
 
 At that point, anyone can use your provider by spec.
 
-## Configuration 
+## Configuration
 
 Current object storage client implementations:
 
 | Provider             | Maturity | Auto-tested on CI | Maintainers |
 |----------------------|-------------------|-----------|---------------|
-| [Google Cloud Storage](#gcs) | Stable  (production usage)             | yes       | @bwplotka   |
-| [AWS/S3](#s3) | Stable  (production usage)               | yes        | @bwplotka          |
-| [Azure Storage Account](#azure) | Stable  (production usage) | yes       | @vglafirov   |
-| [OpenStack Swift](#openstack-swift)      | Beta  (working PoCs, testing usage)               | no        | @sudhi-vm   |
-| [Tencent COS](#tencent-cos)          | Beta  (testing usage)                   | no        | @jojohappy          |
+| [Google Cloud Storage](./storage.md#gcs) | Stable  (production usage)             | yes       | @bwplotka   |
+| [AWS/S3](./storage.md#s3) | Stable  (production usage)               | yes        | @bwplotka          |
+| [Azure Storage Account](./storage.md#azure) | Stable  (production usage) | no       | @vglafirov   |
+| [OpenStack Swift](./storage.md#openstack-swift)      | Beta  (working PoCs, testing usage)               | no        | @sudhi-vm   |
+| [Tencent COS](./storage.md#tencent-cos)          | Beta  (testing usage)                   | no        | @jojohappy          |
+| [AliYun OSS](./storage.md#aliyun-oss)           | Beta  (testing usage)                   | no        | @shaulboozhiao,@wujinhu      |
+| [Local Filesystem](./storage.md#filesystem) | Beta  (testing usage)             | yes       | @bwplotka   |
 
 NOTE: Currently Thanos requires strong consistency (write-read) for object store implementation.
 
@@ -85,12 +87,12 @@ config:
   secret_key: ""
   put_user_metadata: {}
   http_config:
-    idle_conn_timeout: 0s
-    response_header_timeout: 0s
+    idle_conn_timeout: 90s
+    response_header_timeout: 2m
     insecure_skip_verify: false
   trace:
     enable: false
-  part_size: 0
+  part_size: 134217728
 ```
 
 At a minimum, you will need to provide a value for the `bucket`, `endpoint`, `access_key`, and `secret_key` keys. The rest of the keys are optional.
@@ -155,8 +157,11 @@ Example working AWS IAM policy for user:
 (No bucket policy)
 
 To test the policy, set env vars for S3 access for *empty, not used* bucket as well as:
-THANOS_SKIP_GCS_TESTS=true
+
+```
+THANOS_TEST_OBJSTORE_SKIP=GCS,AZURE,SWIFT,COS,ALIYUNOSS
 THANOS_ALLOW_EXISTING_BUCKET_USE=true
+```
 
 And run: `GOCACHE=off go test -v -run TestObjStore_AcceptanceTest_e2e ./pkg/...`
 
@@ -188,7 +193,7 @@ We need access to CreateBucket and DeleteBucket and access to all buckets:
 }
 ```
 
-With this policy you should be able to run set `THANOS_SKIP_GCS_TESTS=true` and unset `S3_BUCKET` and run all tests using `make test`.
+With this policy you should be able to run set `THANOS_TEST_OBJSTORE_SKIP=GCS,AZURE,SWIFT,COS,ALIYUNOSS` and unset `S3_BUCKET` and run all tests using `make test`.
 
 Details about AWS policies: https://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
 
@@ -294,8 +299,8 @@ config:
 
 Thanos uses [gophercloud](http://gophercloud.io/) client to upload Prometheus data into [OpenStack Swift](https://docs.openstack.org/swift/latest/).
 
-Below is an example configuration file for thanos to use OpenStack swift container as an object store.  
-Note that if the `name` of a user, project or tenant is used one must also specify its domain by ID or name.  
+Below is an example configuration file for thanos to use OpenStack swift container as an object store.
+Note that if the `name` of a user, project or tenant is used one must also specify its domain by ID or name.
 Various examples for OpenStack authentication can be found in the [official documentation](https://developer.openstack.org/api-ref/identity/v3/index.html?expanded=password-authentication-with-scoped-authorization-detail#password-authentication-with-unscoped-authorization).
 
 [embedmd]:# (flags/config_bucket_swift.txt yaml)
@@ -324,8 +329,8 @@ To use Tencent COS as storage store, you should apply a Tencent Account to creat
 
 To configure Tencent Account to use COS as storage store you need to set these parameters in yaml format stored in a file:
 
-[embedmd]:# (flags/config_bucket_cos.txt $)
-```$
+[embedmd]:# (flags/config_bucket_cos.txt yaml)
+```yaml
 type: COS
 config:
   bucket: ""
@@ -336,3 +341,37 @@ config:
 ```
 
 Set the flags `--objstore.config-file` to reference to the configuration file.
+
+##  AliYun OSS
+In order to use AliYun OSS object storage, you should first create a bucket with proper Storage Class , ACLs and get the access key on the AliYun cloud. Go to [https://www.alibabacloud.com/product/oss](https://www.alibabacloud.com/product/oss) for more detail.
+
+To use AliYun OSS object storage, please specify following yaml configuration file in `objstore.config*` flag.
+
+[embedmd]:# (flags/config_bucket_aliyunoss.txt yaml)
+```yaml
+type: ALIYUNOSS
+config:
+  endpoint: ""
+  bucket: ""
+  access_key_id: ""
+  access_key_secret: ""
+```
+
+Use --objstore.config-file to reference to this configuration file.
+
+### Filesystem
+
+This storage type is used when user wants to store and access the bucket in the local filesystem.
+We treat filesystem the same way we would treat object storage, so all optimization for remote bucket applies even though,
+we might have the files locally.
+
+NOTE: This storage type is experimental and might be inefficient. It is NOT advised to use it as the main storage for metrics
+in production environment. Particularly there is no planned support for distributed filesystems like NFS.
+This is mainly useful for testing and demos.
+
+[embedmd]:# (flags/config_bucket_filesystem.txt yaml)
+```yaml
+type: FILESYSTEM
+config:
+  directory: ""
+```

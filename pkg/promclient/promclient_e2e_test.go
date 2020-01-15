@@ -13,22 +13,22 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
-func TestIsWALFileAccesible_e2e(t *testing.T) {
+func TestIsWALFileAccessible_e2e(t *testing.T) {
 	testutil.ForeachPrometheus(t, func(t testing.TB, p *testutil.Prometheus) {
 		testutil.Ok(t, p.Start())
 
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 		defer cancel()
-		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error { return IsWALDirAccesible(p.Dir()) }))
+		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error { return IsWALDirAccessible(p.Dir()) }))
 
-		testutil.NotOk(t, IsWALDirAccesible(path.Join(p.Dir(), "/non-existing")))
-		testutil.NotOk(t, IsWALDirAccesible(path.Join(p.Dir(), "/../")))
+		testutil.NotOk(t, IsWALDirAccessible(path.Join(p.Dir(), "/non-existing")))
+		testutil.NotOk(t, IsWALDirAccessible(path.Join(p.Dir(), "/../")))
 	})
 }
 

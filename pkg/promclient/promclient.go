@@ -25,10 +25,10 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	promlabels "github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tracing"
@@ -37,9 +37,9 @@ import (
 
 var ErrFlagEndpointNotFound = errors.New("no flag endpoint found")
 
-// IsWALDirAccesible returns no error if WAL dir can be found. This helps to tell
+// IsWALDirAccessible returns no error if WAL dir can be found. This helps to tell
 // if we have access to Prometheus TSDB directory.
-func IsWALDirAccesible(dir string) error {
+func IsWALDirAccessible(dir string) error {
 	const errMsg = "WAL dir is not accessible. Is this dir a TSDB directory? If yes it is shared with TSDB?"
 
 	f, err := os.Stat(filepath.Join(dir, "wal"))

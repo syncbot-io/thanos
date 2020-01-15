@@ -3,6 +3,7 @@ package v1
 import (
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -69,7 +70,7 @@ func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
 	for _, grp := range api.ruleRetriever.RuleGroups() {
 		apiRuleGroup := &RuleGroup{
 			Name:                    grp.Name(),
-			File:                    grp.File(),
+			File:                    grp.OriginalFile(),
 			Interval:                grp.Interval().Seconds(),
 			Rules:                   []rule{},
 			PartialResponseStrategy: grp.PartialResponseStrategy.String(),
@@ -84,7 +85,7 @@ func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
 			}
 
 			switch rule := r.(type) {
-			case thanosrule.AlertingRule:
+			case *rules.AlertingRule:
 				enrichedRule = alertingRule{
 					Name:                    rule.Name(),
 					Query:                   rule.Query().String(),
@@ -95,7 +96,7 @@ func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
 					Health:                  rule.Health(),
 					LastError:               lastError,
 					Type:                    "alerting",
-					PartialResponseStrategy: rule.PartialResponseStrategy.String(),
+					PartialResponseStrategy: grp.PartialResponseStrategy.String(),
 				}
 			case *rules.RecordingRule:
 				enrichedRule = recordingRule{
@@ -107,7 +108,7 @@ func (api *API) rules(r *http.Request) (interface{}, []error, *qapi.ApiError) {
 					Type:      "recording",
 				}
 			default:
-				err := fmt.Errorf("failed to assert type of rule '%v'", rule.Name())
+				err := fmt.Errorf("rule %q: unsupported type %T", r.Name(), rule)
 				return nil, nil, &qapi.ApiError{Typ: qapi.ErrorInternal, Err: err}
 			}
 
@@ -141,7 +142,7 @@ type Alert struct {
 	Annotations             labels.Labels `json:"annotations"`
 	State                   string        `json:"state"`
 	ActiveAt                *time.Time    `json:"activeAt,omitempty"`
-	Value                   float64       `json:"value"`
+	Value                   string        `json:"value"`
 	PartialResponseStrategy string        `json:"partial_response_strategy"`
 }
 
@@ -154,7 +155,7 @@ func rulesAlertsToAPIAlerts(s storepb.PartialResponseStrategy, rulesAlerts []*ru
 			Annotations:             ruleAlert.Annotations,
 			State:                   ruleAlert.State.String(),
 			ActiveAt:                &ruleAlert.ActiveAt,
-			Value:                   ruleAlert.Value,
+			Value:                   strconv.FormatFloat(ruleAlert.Value, 'e', -1, 64),
 		}
 	}
 

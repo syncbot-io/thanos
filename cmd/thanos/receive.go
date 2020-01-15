@@ -3,12 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
-
-	"github.com/thanos-io/thanos/pkg/extflag"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -17,17 +14,20 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage/tsdb"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/receive"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
+	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
-	"google.golang.org/grpc"
+	"github.com/thanos-io/thanos/pkg/tls"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -35,11 +35,18 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 	comp := component.Receive
 	cmd := app.Command(comp.String(), "Accept Prometheus remote write API requests and write to local tsdb (EXPERIMENTAL, this may change drastically without notice)")
 
-	grpcBindAddr, cert, key, clientCA := regGRPCFlags(cmd)
-	httpBindAddr := regHTTPAddrFlag(cmd)
+	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
+	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
 
-	remoteWriteAddress := cmd.Flag("remote-write.address", "Address to listen on for remote write requests.").
+	rwAddress := cmd.Flag("remote-write.address", "Address to listen on for remote write requests.").
 		Default("0.0.0.0:19291").String()
+	rwServerCert := cmd.Flag("remote-write.server-tls-cert", "TLS Certificate for HTTP server, leave blank to disable TLS").Default("").String()
+	rwServerKey := cmd.Flag("remote-write.server-tls-key", "TLS Key for the HTTP server, leave blank to disable TLS").Default("").String()
+	rwServerClientCA := cmd.Flag("remote-write.server-tls-client-ca", "TLS CA to verify clients against. If no client CA is specified, there is no client verification on server side. (tls.NoClientCert)").Default("").String()
+	rwClientCert := cmd.Flag("remote-write.client-tls-cert", "TLS Certificates to use to identify this client to the server").Default("").String()
+	rwClientKey := cmd.Flag("remote-write.client-tls-key", "TLS Key for the client's certificate").Default("").String()
+	rwClientServerCA := cmd.Flag("remote-write.client-tls-ca", "TLS CA Certificates to use to verify servers").Default("").String()
+	rwClientServerName := cmd.Flag("remote-write.client-server-name", "Server name to verify the hostname on the returned gRPC certificates. See https://tools.ietf.org/html/rfc4366#section-3.1").Default("").String()
 
 	dataDir := cmd.Flag("tsdb.path", "Data directory of TSDB.").
 		Default("./data").String()
@@ -87,7 +94,7 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 			if hostname == "" || err != nil {
 				return errors.New("--receive.local-endpoint is empty and host could not be determined.")
 			}
-			parts := strings.Split(*remoteWriteAddress, ":")
+			parts := strings.Split(*rwAddress, ":")
 			port := parts[len(parts)-1]
 			*local = fmt.Sprintf("http://%s:%s/api/v1/receive", hostname, port)
 		}
@@ -98,11 +105,20 @@ func registerReceive(m map[string]setupFunc, app *kingpin.Application) {
 			reg,
 			tracer,
 			*grpcBindAddr,
-			*cert,
-			*key,
-			*clientCA,
+			time.Duration(*grpcGracePeriod),
+			*grpcCert,
+			*grpcKey,
+			*grpcClientCA,
 			*httpBindAddr,
-			*remoteWriteAddress,
+			time.Duration(*httpGracePeriod),
+			*rwAddress,
+			*rwServerCert,
+			*rwServerKey,
+			*rwServerClientCA,
+			*rwClientCert,
+			*rwClientKey,
+			*rwClientServerCA,
+			*rwClientServerName,
 			*dataDir,
 			objStoreConfig,
 			lset,
@@ -124,11 +140,20 @@ func runReceive(
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
 	grpcBindAddr string,
-	cert string,
-	key string,
-	clientCA string,
+	grpcGracePeriod time.Duration,
+	grpcCert string,
+	grpcKey string,
+	grpcClientCA string,
 	httpBindAddr string,
-	remoteWriteAddress string,
+	httpGracePeriod time.Duration,
+	rwAddress string,
+	rwServerCert string,
+	rwServerKey string,
+	rwServerClientCA string,
+	rwClientCert string,
+	rwClientKey string,
+	rwClientServerCA string,
+	rwClientServerName string,
 	dataDir string,
 	objStoreConfig *extflag.PathOrContent,
 	lset labels.Labels,
@@ -139,7 +164,7 @@ func runReceive(
 	replicaHeader string,
 	replicationFactor uint64,
 	tsdbBlockDuration model.Duration,
-	comp component.Component,
+	comp component.SourceStoreAPI,
 ) error {
 	logger = log.With(logger, "component", "receive")
 	level.Warn(logger).Log("msg", "setting up receive; the Thanos receive component is EXPERIMENTAL, it may break significantly without notice")
@@ -153,17 +178,27 @@ func runReceive(
 	}
 
 	localStorage := &tsdb.ReadyStorage{}
+	rwTLSConfig, err := tls.NewServerConfig(log.With(logger, "protocol", "HTTP"), rwServerCert, rwServerKey, rwServerClientCA)
+	if err != nil {
+		return err
+	}
+	rwTLSClientConfig, err := tls.NewClientConfig(logger, rwClientCert, rwClientKey, rwClientServerCA, rwClientServerName)
+	if err != nil {
+		return err
+	}
 	webHandler := receive.NewHandler(log.With(logger, "component", "receive-handler"), &receive.Options{
-		ListenAddress:     remoteWriteAddress,
+		ListenAddress:     rwAddress,
 		Registry:          reg,
 		Endpoint:          endpoint,
 		TenantHeader:      tenantHeader,
 		ReplicaHeader:     replicaHeader,
 		ReplicationFactor: replicationFactor,
 		Tracer:            tracer,
+		TLSConfig:         rwTLSConfig,
+		TLSClientConfig:   rwTLSClientConfig,
 	})
 
-	statusProber := prober.NewProber(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
+	statusProber := prober.New(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
 	confContentYaml, err := objStoreConfig.Content()
 	if err != nil {
 		return err
@@ -195,6 +230,9 @@ func runReceive(
 			defer close(dbReady)
 			defer close(uploadC)
 
+			// Before actually starting, we need to make sure the
+			// WAL is flushed. The WAL is flushed after the
+			// hashring is loaded.
 			db := receive.NewFlushableStorage(
 				dataDir,
 				log.With(logger, "component", "tsdb"),
@@ -202,22 +240,10 @@ func runReceive(
 				tsdbCfg,
 			)
 
-			// Before actually starting, we need to make sure the
-			// WAL is flushed. The WAL is flushed after the
-			// hashring ring is loaded.
-			if err := db.Open(); err != nil {
-				return errors.Wrap(err, "opening storage")
-			}
-
 			// Before quitting, ensure the WAL is flushed and the DB is closed.
 			defer func() {
 				if err := db.Flush(); err != nil {
 					level.Warn(logger).Log("err", err, "msg", "failed to flush storage")
-					return
-				}
-				if err := db.Close(); err != nil {
-					level.Warn(logger).Log("err", err, "msg", "failed to close storage")
-					return
 				}
 			}()
 
@@ -232,6 +258,9 @@ func runReceive(
 					if err := db.Flush(); err != nil {
 						return errors.Wrap(err, "flushing storage")
 					}
+					if err := db.Open(); err != nil {
+						return errors.Wrap(err, "opening storage")
+					}
 					if upload {
 						uploadC <- struct{}{}
 						<-uploadDone
@@ -239,7 +268,7 @@ func runReceive(
 					level.Info(logger).Log("msg", "tsdb started")
 					localStorage.Set(db.Get(), startTimeMargin)
 					webHandler.SetWriter(receive.NewWriter(log.With(logger, "component", "receive-writer"), localStorage))
-					statusProber.SetReady()
+					statusProber.Ready()
 					level.Info(logger).Log("msg", "server is ready to receive web requests.")
 					dbReady <- struct{}{}
 				}
@@ -289,7 +318,7 @@ func runReceive(
 					webHandler.SetWriter(nil)
 					webHandler.Hashring(h)
 					msg := "hashring has changed; server is not ready to receive web requests."
-					statusProber.SetNotReady(errors.New(msg))
+					statusProber.NotReady(errors.New(msg))
 					level.Info(logger).Log("msg", msg)
 					updateDB <- struct{}{}
 				case <-cancel:
@@ -304,40 +333,50 @@ func runReceive(
 
 	level.Debug(logger).Log("msg", "setting up http server")
 	// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
-	if err := scheduleHTTPServer(g, logger, reg, statusProber, httpBindAddr, nil, comp); err != nil {
-		return errors.Wrap(err, "schedule HTTP server with probes")
-	}
+	srv := httpserver.New(logger, reg, comp, statusProber,
+		httpserver.WithListen(httpBindAddr),
+		httpserver.WithGracePeriod(httpGracePeriod),
+	)
+	g.Add(func() error {
+		statusProber.Healthy()
+
+		return srv.ListenAndServe()
+	}, func(err error) {
+		statusProber.NotReady(err)
+		defer statusProber.NotHealthy(err)
+
+		srv.Shutdown(err)
+	})
 
 	level.Debug(logger).Log("msg", "setting up grpc server")
 	{
-		var (
-			s *grpc.Server
-			l net.Listener
-		)
+		var s *grpcserver.Server
 		startGRPC := make(chan struct{})
 		g.Add(func() error {
 			defer close(startGRPC)
-			opts, err := defaultGRPCServerOpts(logger, cert, key, clientCA)
+
+			tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
 			if err != nil {
 				return errors.Wrap(err, "setup gRPC server")
 			}
 
 			for range dbReady {
 				if s != nil {
-					s.Stop()
+					s.Shutdown(errors.New("reload hashrings"))
 				}
-				l, err = net.Listen("tcp", grpcBindAddr)
-				if err != nil {
-					return errors.Wrap(err, "listen API address")
-				}
-				tsdbStore := store.NewTSDBStore(log.With(logger, "component", "thanos-tsdb-store"), nil, localStorage.Get(), component.Receive, lset)
-				s = newStoreGRPCServer(logger, &receive.UnRegisterer{Registerer: reg}, tracer, tsdbStore, opts)
+				tsdbStore := store.NewTSDBStore(log.With(logger, "component", "thanos-tsdb-store"), nil, localStorage.Get(), comp, lset)
+
+				s = grpcserver.New(logger, &receive.UnRegisterer{Registerer: reg}, tracer, comp, tsdbStore,
+					grpcserver.WithListen(grpcBindAddr),
+					grpcserver.WithGracePeriod(grpcGracePeriod),
+					grpcserver.WithTLSConfig(tlsCfg),
+				)
 				startGRPC <- struct{}{}
 			}
 			return nil
-		}, func(error) {
+		}, func(err error) {
 			if s != nil {
-				s.Stop()
+				s.Shutdown(err)
 			}
 		})
 		// We need to be able to start and stop the gRPC server
@@ -345,7 +384,7 @@ func runReceive(
 		g.Add(func() error {
 			for range startGRPC {
 				level.Info(logger).Log("msg", "listening for StoreAPI gRPC", "address", grpcBindAddr)
-				if err := s.Serve(l); err != nil {
+				if err := s.ListenAndServe(); err != nil {
 					return errors.Wrap(err, "serve gRPC")
 				}
 			}
@@ -368,7 +407,7 @@ func runReceive(
 	if upload {
 		// The background shipper continuously scans the data directory and uploads
 		// new blocks to Google Cloud Storage or an S3-compatible storage service.
-		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Sidecar.String())
+		bkt, err := client.NewBucket(logger, confContentYaml, reg, comp.String())
 		if err != nil {
 			return err
 		}
@@ -413,6 +452,11 @@ func runReceive(
 				}()
 				defer close(uploadDone)
 				for {
+					select {
+					case <-ctx.Done():
+						return nil
+					default:
+					}
 					select {
 					case <-ctx.Done():
 						return nil

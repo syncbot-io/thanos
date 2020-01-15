@@ -9,7 +9,10 @@ menu: components
 The compactor component of Thanos applies the compaction procedure of the Prometheus 2.0 storage engine to block data stored in object storage.
 It is generally not semantically concurrency safe and must be deployed as a singleton against a bucket.
 
-It is also responsible for downsampling of data - performing 5m downsampling after **40 hours** and 1h downsampling after **10 days**.
+It is also responsible for downsampling of data:
+
+* creating 5m downsampling for blocks larger than **40 hours** (2d, 2w)
+* creating 1h downsampling for blocks larger than **10 days** (2w).
 
 Example:
 
@@ -50,8 +53,8 @@ In fact, downsampling doesn't save you any space but instead it adds 2 more bloc
 
 ## Groups
 
-The compactor groups blocks using the [external_labels](https://thanos.io/getting-started.md/#external-labels) added by the
-Prometheus who produced the block. The labels must be both _unique_ and _persistent_ across different Prometheus instances.
+The compactor groups blocks using the external_labels added by the Prometheus who produced the block.
+The labels must be both _unique_ and _persistent_ across different Prometheus instances.
 
 By _unique_, we mean that the set of labels in a Prometheus instance must be different from all other sets of labels of
 your Prometheus instances, so that the compactor will be able to group blocks by Prometheus instance.
@@ -84,6 +87,8 @@ Flags:
                                https://thanos.io/tracing.md/#configuration
       --http-address="0.0.0.0:10902"
                                Listen host:port for HTTP endpoints.
+      --http-grace-period=2m   Time to wait after an interrupt received for HTTP
+                               Server.
       --data-dir="./data"      Data directory in which to cache blocks and
                                process compactions.
       --objstore.config-file=<file-path>
@@ -98,7 +103,7 @@ Flags:
       --consistency-delay=30m  Minimum age of fresh (non-compacted) blocks
                                before they are being processed. Malformed blocks
                                older than the maximum of consistency-delay and
-                               30m0s will be removed.
+                               48h0m0s will be removed.
       --retention.resolution-raw=0d
                                How long to retain raw samples in bucket. 0d -
                                disables this retention

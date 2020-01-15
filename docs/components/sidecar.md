@@ -8,12 +8,12 @@ menu: components
 
 The sidecar component of Thanos gets deployed along with a Prometheus instance. This allows sidecar to optionally upload metrics to object storage and allow [Queriers](./query.md) to query Prometheus data with common, efficient StoreAPI.
 
-In details: 
+In details:
 
 * It implements Thanos' Store API on top of Prometheus' remote-read API. This allows [Queriers](./query.md) to treat Prometheus servers as yet another source of time series data without directly talking to its APIs.
 * Optionally, the sidecar uploads TSDB blocks to an object storage bucket as Prometheus produces them every 2 hours. This allows Prometheus servers to be run with relatively low retention while their historic data is made durable and queryable via object storage.
 
-  NOTE: This still does NOT mean that Prometheus can be fully stateless, because if it crashes and restarts you will lose ~2 hours of metrics, so persistent disk for Prometheus is highly recommended. The closest to stateless you can get is using remote write (which Thanos experimentally supports, see [this](../proposals/201812_thanos-remote-receive.md). Remote write has other risks and consequences, and still if crashed you loose in positive case seconds of metrics data, so persistent disk is recommended in all cases. 
+  NOTE: This still does NOT mean that Prometheus can be fully stateless, because if it crashes and restarts you will lose ~2 hours of metrics, so persistent disk for Prometheus is highly recommended. The closest to stateless you can get is using remote write (which Thanos experimentally supports, see [this](../proposals/201812_thanos-remote-receive.md). Remote write has other risks and consequences, and still if crashed you loose in positive case seconds of metrics data, so persistent disk is recommended in all cases.
 
 * Optionally Thanos sidecar is able to watch Prometheus rules and configuration, decompress and substitute environment variables if needed and ping Prometheus to reload them. Read more about this in [here](./sidecar.md#reloader-configuration)
 
@@ -22,15 +22,18 @@ Prometheus servers connected to the Thanos cluster via the sidecar are subject t
 
 * The recommended Prometheus version is 2.2.1 or greater (including newest releases). This is due to Prometheus instability in previous versions as well as lack of `flags` endpoint.
 * (!) The Prometheus `external_labels` section of the Prometheus configuration file has unique labels in the overall Thanos system. Those external labels will be used by the sidecar and then Thanos in many places:
-  
+
   * [Querier](./query.md) to filter out store APIs to touch during query requests.
   * Many object storage readers like [compactor](./compact.md) and [store gateway](./store.md) which groups the blocks by Prometheus source. Each produced TSDB block by Prometheus is labelled with external label by sidecar before upload to object storage.
-  
+
+* The `--web.enable-admin-api` flag is enabled to support sidecar to get metadata from Prometheus like external labels.
 * The `--web.enable-lifecycle` flag is enabled if you want to use sidecar reloading features (`--reload.*` flags).
 
-If you choose to use the sidecar to also upload to object storage:
+If you choose to use the sidecar to also upload data to object storage:
 
-* The `--storage.tsdb.min-block-duration` and `--storage.tsdb.max-block-duration` must be set to equal values to disable local compaction on order to use Thanos sidecar upload, otherwise leave local compaction on if sidecar just exposes StoreAPI and your retention is normal. The default of `2h` is recommended. 
+* Must specify object storage (`--objstore.*` flags)
+* It only uploads uncompacted Prometheus blocks. For compacted blocks, see [Upload compacted blocks](./sidecar.md/#upload-compacted-blocks-experimental).
+* The `--storage.tsdb.min-block-duration` and `--storage.tsdb.max-block-duration` must be set to equal values to disable local compaction on order to use Thanos sidecar upload, otherwise leave local compaction on if sidecar just exposes StoreAPI and your retention is normal. The default of `2h` is recommended.
   Mentioned parameters set to equal values disable the internal Prometheus compaction, which is needed to avoid the uploaded data corruption when Thanos compactor does its job, this is critical for data consistency and should not be ignored if you plan to use Thanos compactor. Even though you set mentioned parameters equal, you might observe Prometheus internal metric `prometheus_tsdb_compactions_total` being incremented, don't be confused by that: Prometheus writes initial head block to filesytem via its internal compaction mechanism, but if you have followed recommendations - data won't be modified by Prometheus before the sidecar uploads it. Thanos sidecar will also check sanity of the flags set to Prometheus on the startup and log errors or warning if they have been configured improperly (#838).
 * The retention is recommended to not be lower than three times the min block duration, so 6 hours. This achieves resilience in the face of connectivity issues to the object storage since all local data will remain available within the Thanos cluster. If connectivity gets restored the backlog of blocks gets uploaded to the object storage.
 
@@ -69,7 +72,7 @@ config:
 
 ## Upload compacted blocks (EXPERIMENTAL)
 
-If you want to migrate from a pure Prometheus setup to Thanos and have to keep the historical data, you can use the flag `--shipper.upload-compacted`. This will also upload blocks that were compacted by Prometheus.
+If you want to migrate from a pure Prometheus setup to Thanos and have to keep the historical data, you can use the flag `--shipper.upload-compacted`. This will also upload blocks that were compacted by Prometheus. Values greater than 1 in the `compaction.level` field of a Prometheus block’s `meta.json` file indicate level of compaction.
 
 To use this, the Prometheus compaction needs to be disabled. This can be done by setting the following flags for Prometheus:
 
@@ -101,10 +104,14 @@ Flags:
                                  https://thanos.io/tracing.md/#configuration
       --http-address="0.0.0.0:10902"
                                  Listen host:port for HTTP endpoints.
+      --http-grace-period=2m     Time to wait after an interrupt received for
+                                 HTTP Server.
       --grpc-address="0.0.0.0:10901"
                                  Listen ip:port address for gRPC endpoints
                                  (StoreAPI). Make sure this address is routable
                                  from other components.
+      --grpc-grace-period=2m     Time to wait after an interrupt received for
+                                 GRPC Server.
       --grpc-server-tls-cert=""  TLS Certificate for gRPC server, leave blank to
                                  disable TLS
       --grpc-server-tls-key=""   TLS Key for the gRPC server, leave blank to
@@ -116,6 +123,9 @@ Flags:
       --prometheus.url=http://localhost:9090
                                  URL at which to reach Prometheus's API. For
                                  better performance use local network.
+      --prometheus.ready_timeout=10m
+                                 Maximum time to wait for the Prometheus
+                                 instance to start up
       --tsdb.path="./data"       Data directory of TSDB.
       --reloader.config-file=""  Config file watched by the reloader.
       --reloader.config-envsubst-file=""
@@ -134,6 +144,12 @@ Flags:
                                  contains object store configuration. See format
                                  details:
                                  https://thanos.io/storage.md/#configuration
+      --shipper.upload-compacted
+                                 If true sidecar will try to upload compacted
+                                 blocks as well. Useful for migration purposes.
+                                 Works only if compaction is disabled on
+                                 Prometheus. Do it once and then disable the
+                                 flag when done.
       --min-time=0000-01-01T00:00:00Z
                                  Start of time range limit to serve. Thanos
                                  sidecar will serve only metrics, which happened

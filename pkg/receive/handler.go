@@ -3,6 +3,7 @@ package receive
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
@@ -16,7 +17,6 @@ import (
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
 	conntrack "github.com/mwitkow/go-conntrack"
-	"github.com/opentracing-contrib/go-stdlib/nethttp"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -49,6 +49,8 @@ type Options struct {
 	ReplicaHeader     string
 	ReplicationFactor uint64
 	Tracer            opentracing.Tracer
+	TLSConfig         *tls.Config
+	TLSClientConfig   *tls.Config
 }
 
 // Handler serves a Prometheus remote write receiving HTTP endpoint.
@@ -72,9 +74,11 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		logger = log.NewNopLogger()
 	}
 
-	client := &http.Client{}
+	transport := http.DefaultTransport.(*http.Transport)
+	transport.TLSClientConfig = o.TLSClientConfig
+	client := &http.Client{Transport: transport}
 	if o.Tracer != nil {
-		client.Transport = tracing.HTTPTripperware(logger, http.DefaultTransport)
+		client.Transport = tracing.HTTPTripperware(logger, client.Transport)
 	}
 
 	h := &Handler{
@@ -177,17 +181,12 @@ func (h *Handler) Run() error {
 		conntrack.TrackWithName("http"),
 		conntrack.TrackWithTracing())
 
-	operationName := nethttp.OperationNameFunc(func(r *http.Request) string {
-		return fmt.Sprintf("%s %s", r.Method, r.URL.Path)
-	})
-	mux := http.NewServeMux()
-	mux.Handle("/", h.router)
-
 	errlog := stdlog.New(log.NewStdlibAdapter(level.Error(h.logger)), "", 0)
 
 	httpSrv := &http.Server{
-		Handler:  nethttp.Middleware(opentracing.GlobalTracer(), mux, operationName),
-		ErrorLog: errlog,
+		Handler:   h.router,
+		ErrorLog:  errlog,
+		TLSConfig: h.options.TLSConfig,
 	}
 
 	return httpSrv.Serve(h.listener)

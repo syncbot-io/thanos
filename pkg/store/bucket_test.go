@@ -2,11 +2,15 @@ package store
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,14 +20,11 @@ import (
 	"github.com/leanovate/gopter/gen"
 	"github.com/leanovate/gopter/prop"
 	"github.com/oklog/ulid"
-	prommodel "github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/relabel"
-	"github.com/prometheus/prometheus/pkg/timestamp"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
-	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/inmem"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -298,37 +299,37 @@ func TestBucketBlockSet_labelMatchers(t *testing.T) {
 	set := newBucketBlockSet(labels.FromStrings("a", "b", "c", "d"))
 
 	cases := []struct {
-		in    []labels.Matcher
-		res   []labels.Matcher
+		in    []*labels.Matcher
+		res   []*labels.Matcher
 		match bool
 	}{
 		{
-			in:    []labels.Matcher{},
-			res:   []labels.Matcher{},
+			in:    []*labels.Matcher{},
+			res:   []*labels.Matcher{},
 			match: true,
 		},
 		{
-			in: []labels.Matcher{
-				labels.NewEqualMatcher("a", "b"),
-				labels.NewEqualMatcher("c", "d"),
+			in: []*labels.Matcher{
+				{Type: labels.MatchEqual, Name: "a", Value: "b"},
+				{Type: labels.MatchEqual, Name: "c", Value: "d"},
 			},
-			res:   []labels.Matcher{},
+			res:   []*labels.Matcher{},
 			match: true,
 		},
 		{
-			in: []labels.Matcher{
-				labels.NewEqualMatcher("a", "b"),
-				labels.NewEqualMatcher("c", "b"),
+			in: []*labels.Matcher{
+				{Type: labels.MatchEqual, Name: "a", Value: "b"},
+				{Type: labels.MatchEqual, Name: "c", Value: "b"},
 			},
 			match: false,
 		},
 		{
-			in: []labels.Matcher{
-				labels.NewEqualMatcher("a", "b"),
-				labels.NewEqualMatcher("e", "f"),
+			in: []*labels.Matcher{
+				{Type: labels.MatchEqual, Name: "a", Value: "b"},
+				{Type: labels.MatchEqual, Name: "e", Value: "f"},
 			},
-			res: []labels.Matcher{
-				labels.NewEqualMatcher("e", "f"),
+			res: []*labels.Matcher{
+				{Type: labels.MatchEqual, Name: "e", Value: "f"},
 			},
 			match: true,
 		},
@@ -336,20 +337,20 @@ func TestBucketBlockSet_labelMatchers(t *testing.T) {
 		// We want to provide explicit tests that says when Thanos supports its and when not. We don't support it here in
 		// external labelset level.
 		{
-			in: []labels.Matcher{
-				labels.Not(labels.NewEqualMatcher("", "x")),
+			in: []*labels.Matcher{
+				{Type: labels.MatchNotEqual, Name: "", Value: "x"},
 			},
-			res: []labels.Matcher{
-				labels.Not(labels.NewEqualMatcher("", "x")),
+			res: []*labels.Matcher{
+				{Type: labels.MatchNotEqual, Name: "", Value: "x"},
 			},
 			match: true,
 		},
 		{
-			in: []labels.Matcher{
-				labels.Not(labels.NewEqualMatcher("", "d")),
+			in: []*labels.Matcher{
+				{Type: labels.MatchNotEqual, Name: "", Value: "d"},
 			},
-			res: []labels.Matcher{
-				labels.Not(labels.NewEqualMatcher("", "d")),
+			res: []*labels.Matcher{
+				{Type: labels.MatchNotEqual, Name: "", Value: "d"},
 			},
 			match: true,
 		},
@@ -430,7 +431,10 @@ func TestBucketStore_Info(t *testing.T) {
 	dir, err := ioutil.TempDir("", "bucketstore-test")
 	testutil.Ok(t, err)
 
+	defer testutil.Ok(t, os.RemoveAll(dir))
+
 	bucketStore, err := NewBucketStore(
+		nil,
 		nil,
 		nil,
 		nil,
@@ -441,8 +445,7 @@ func TestBucketStore_Info(t *testing.T) {
 		0,
 		false,
 		20,
-		filterConf,
-		emptyRelabelConfig,
+		allowAllFilterConf,
 		true,
 	)
 	testutil.Ok(t, err)
@@ -453,220 +456,307 @@ func TestBucketStore_Info(t *testing.T) {
 	testutil.Equals(t, storepb.StoreType_STORE, resp.StoreType)
 	testutil.Equals(t, int64(math.MaxInt64), resp.MinTime)
 	testutil.Equals(t, int64(math.MinInt64), resp.MaxTime)
-	testutil.Equals(t, []storepb.LabelSet{}, resp.LabelSets)
+	testutil.Equals(t, []storepb.LabelSet(nil), resp.LabelSets)
 	testutil.Equals(t, []storepb.Label(nil), resp.Labels)
 }
 
-func TestBucketStore_isBlockInMinMaxRange(t *testing.T) {
-	ctx := context.TODO()
-	dir, err := ioutil.TempDir("", "block-min-max-test")
-	testutil.Ok(t, err)
+type recorder struct {
+	mtx sync.Mutex
+	objstore.Bucket
 
-	series := []labels.Labels{labels.FromStrings("a", "1", "b", "1")}
-	extLset := labels.FromStrings("ext1", "value1")
-
-	// Create a block in range [-2w, -1w].
-	id1, err := testutil.CreateBlock(ctx, dir, series, 10,
-		timestamp.FromTime(time.Now().Add(-14*24*time.Hour)),
-		timestamp.FromTime(time.Now().Add(-7*24*time.Hour)),
-		extLset, 0)
-	testutil.Ok(t, err)
-
-	// Create a block in range [-1w, 0w].
-	id2, err := testutil.CreateBlock(ctx, dir, series, 10,
-		timestamp.FromTime(time.Now().Add(-7*24*time.Hour)),
-		timestamp.FromTime(time.Now().Add(-0*24*time.Hour)),
-		extLset, 0)
-	testutil.Ok(t, err)
-
-	// Create a block in range [+1w, +2w].
-	id3, err := testutil.CreateBlock(ctx, dir, series, 10,
-		timestamp.FromTime(time.Now().Add(7*24*time.Hour)),
-		timestamp.FromTime(time.Now().Add(14*24*time.Hour)),
-		extLset, 0)
-	testutil.Ok(t, err)
-
-	dir1, dir2 := filepath.Join(dir, id1.String()), filepath.Join(dir, id2.String())
-	meta1, err := metadata.Read(dir1)
-	testutil.Ok(t, err)
-	testutil.Ok(t, metadata.Write(log.NewNopLogger(), dir1, meta1))
-
-	meta2, err := metadata.Read(dir2)
-	testutil.Ok(t, err)
-	testutil.Ok(t, metadata.Write(log.NewNopLogger(), dir2, meta2))
-
-	// Run actual test.
-	hourBeforeDur := prommodel.Duration(-1 * time.Hour)
-	hourBefore := model.TimeOrDurationValue{Dur: &hourBeforeDur}
-
-	// bucketStore accepts blocks in range [0, now-1h].
-	bucketStore, err := NewBucketStore(nil, nil, inmem.NewBucket(), dir, noopCache{}, 0, 0, 20, false, 20,
-		&FilterConfig{
-			MinTime: minTimeDuration,
-			MaxTime: hourBefore,
-		}, emptyRelabelConfig, true)
-	testutil.Ok(t, err)
-
-	inRange, err := bucketStore.isBlockInMinMaxRange(context.TODO(), id1)
-	testutil.Ok(t, err)
-	testutil.Equals(t, true, inRange)
-
-	inRange, err = bucketStore.isBlockInMinMaxRange(context.TODO(), id2)
-	testutil.Ok(t, err)
-	testutil.Equals(t, true, inRange)
-
-	inRange, err = bucketStore.isBlockInMinMaxRange(context.TODO(), id3)
-	testutil.Ok(t, err)
-	testutil.Equals(t, false, inRange)
+	touched []string
 }
 
-func TestBucketStore_selectorBlocks(t *testing.T) {
-	ctx := context.TODO()
+func (r *recorder) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	r.mtx.Lock()
+	defer r.mtx.Unlock()
+
+	r.touched = append(r.touched, name)
+	return r.Bucket.Get(ctx, name)
+}
+
+func TestBucketStore_Sharding(t *testing.T) {
+	ctx := context.Background()
 	logger := log.NewNopLogger()
-	dir, err := ioutil.TempDir("", "selector-blocks")
+
+	dir, err := ioutil.TempDir("", "test-sharding-prepare")
 	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+
 	bkt := inmem.NewBucket()
 	series := []labels.Labels{labels.FromStrings("a", "1", "b", "1")}
 
-	id1, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "A"}}, 0)
+	id1, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "a"}, {Name: "region", Value: "r1"}}, 0)
 	testutil.Ok(t, err)
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id1.String(), block.MetaFilename), path.Join(id1.String(), block.MetaFilename)))
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id1.String(), block.IndexFilename), path.Join(id1.String(), block.IndexFilename)))
+	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id1.String())))
 
-	id2, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "B"}}, 0)
+	id2, err := testutil.CreateBlock(ctx, dir, series, 10, 1000, 2000, labels.Labels{{Name: "cluster", Value: "a"}, {Name: "region", Value: "r1"}}, 0)
 	testutil.Ok(t, err)
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id2.String(), block.MetaFilename), path.Join(id2.String(), block.MetaFilename)))
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id2.String(), block.IndexFilename), path.Join(id2.String(), block.IndexFilename)))
+	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id2.String())))
 
-	id3, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "A"}}, 0)
+	id3, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "b"}, {Name: "region", Value: "r1"}}, 0)
 	testutil.Ok(t, err)
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id3.String(), block.MetaFilename), path.Join(id3.String(), block.MetaFilename)))
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id3.String(), block.IndexFilename), path.Join(id3.String(), block.IndexFilename)))
+	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id3.String())))
 
+	id4, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "a"}, {Name: "region", Value: "r2"}}, 0)
+	testutil.Ok(t, err)
+	testutil.Ok(t, block.Upload(ctx, logger, bkt, filepath.Join(dir, id4.String())))
+
+	if ok := t.Run("new_runs", func(t *testing.T) {
+		testSharding(t, "", bkt, id1, id2, id3, id4)
+	}); !ok {
+		return
+	}
+
+	dir2, err := ioutil.TempDir("", "test-sharding2")
+	testutil.Ok(t, err)
+	defer func() { testutil.Ok(t, os.RemoveAll(dir2)) }()
+
+	if ok := t.Run("reuse_disk", func(t *testing.T) {
+		testSharding(t, dir2, bkt, id1, id2, id3, id4)
+	}); !ok {
+		return
+	}
+
+}
+
+func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ulid.ULID) {
+	var cached []ulid.ULID
+
+	logger := log.NewLogfmtLogger(os.Stderr)
 	for _, sc := range []struct {
-		relabelContentYaml string
-		exceptedLength     int
-		exceptedIds        []ulid.ULID
+		name              string
+		relabel           string
+		expectedIDs       []ulid.ULID
+		expectedAdvLabels []storepb.LabelSet
 	}{
 		{
-			relabelContentYaml: `
-            - action: drop
-              regex: "A"
-              source_labels:
-              - cluster
-            `,
-			exceptedLength: 1,
-			exceptedIds:    []ulid.ULID{id2},
+			name:        "no sharding",
+			expectedIDs: all,
+			expectedAdvLabels: []storepb.LabelSet{
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "a"},
+						{Name: "region", Value: "r1"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "a"},
+						{Name: "region", Value: "r2"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "b"},
+						{Name: "region", Value: "r1"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: CompatibilityTypeLabelName, Value: "store"},
+					},
+				},
+			},
 		},
 		{
-			relabelContentYaml: `
-            - action: keep
-              regex: "A"
+			name: "drop cluster=a sources",
+			relabel: `
+            - action: drop
+              regex: "a"
               source_labels:
               - cluster
             `,
-			exceptedLength: 2,
-			exceptedIds:    []ulid.ULID{id1, id3},
+			expectedIDs: []ulid.ULID{all[2]},
+			expectedAdvLabels: []storepb.LabelSet{
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "b"},
+						{Name: "region", Value: "r1"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: CompatibilityTypeLabelName, Value: "store"},
+					},
+				},
+			},
+		},
+		{
+			name: "keep only cluster=a sources",
+			relabel: `
+            - action: keep
+              regex: "a"
+              source_labels:
+              - cluster
+            `,
+			expectedIDs: []ulid.ULID{all[0], all[1], all[3]},
+			expectedAdvLabels: []storepb.LabelSet{
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "a"},
+						{Name: "region", Value: "r1"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "a"},
+						{Name: "region", Value: "r2"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: CompatibilityTypeLabelName, Value: "store"},
+					},
+				},
+			},
+		},
+		{
+			name: "keep only cluster=a without .*2 region sources",
+			relabel: `
+            - action: keep
+              regex: "a"
+              source_labels:
+              - cluster
+            - action: drop
+              regex: ".*2"
+              source_labels:
+              - region
+            `,
+			expectedIDs: []ulid.ULID{all[0], all[1]},
+			expectedAdvLabels: []storepb.LabelSet{
+				{
+					Labels: []storepb.Label{
+						{Name: "cluster", Value: "a"},
+						{Name: "region", Value: "r1"},
+					},
+				},
+				{
+					Labels: []storepb.Label{
+						{Name: CompatibilityTypeLabelName, Value: "store"},
+					},
+				},
+			},
+		},
+		{
+			name: "drop all",
+			relabel: `
+            - action: drop
+              regex: "a"
+              source_labels:
+              - cluster
+            - action: drop
+              regex: "r1"
+              source_labels:
+              - region
+            `,
+			expectedIDs:       []ulid.ULID{},
+			expectedAdvLabels: []storepb.LabelSet(nil),
 		},
 	} {
-		var relabelConf []*relabel.Config
-		err = yaml.Unmarshal([]byte(sc.relabelContentYaml), &relabelConf)
-		testutil.Ok(t, err)
+		t.Run(sc.name, func(t *testing.T) {
+			dir := reuseDisk
 
-		bucketStore, err := NewBucketStore(nil, nil, bkt, dir, noopCache{}, 0, 0, 20, false, 20,
-			filterConf, relabelConf, true)
-		testutil.Ok(t, err)
+			if dir == "" {
+				var err error
+				dir, err = ioutil.TempDir("", "test-sharding")
+				testutil.Ok(t, err)
+				defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+			}
 
-		for _, id := range []ulid.ULID{id1, id2, id3} {
-			testutil.Ok(t, bucketStore.addBlock(ctx, id))
-		}
-		testutil.Equals(t, sc.exceptedLength, len(bucketStore.blocks))
+			var relabelConf []*relabel.Config
+			testutil.Ok(t, yaml.Unmarshal([]byte(sc.relabel), &relabelConf))
 
-		ids := make([]ulid.ULID, 0, len(bucketStore.blocks))
-		for id := range bucketStore.blocks {
-			ids = append(ids, id)
-		}
-		sort.Slice(sc.exceptedIds, func(i, j int) bool {
-			return sc.exceptedIds[i].Compare(sc.exceptedIds[j]) > 0
+			rec := &recorder{Bucket: bkt}
+			metaFetcher, err := block.NewMetaFetcher(logger, 20, bkt, dir, nil,
+				block.NewTimePartitionMetaFilter(allowAllFilterConf.MinTime, allowAllFilterConf.MaxTime).Filter,
+				block.NewLabelShardedMetaFilter(relabelConf).Filter,
+			)
+			testutil.Ok(t, err)
+
+			bucketStore, err := NewBucketStore(
+				logger,
+				nil,
+				rec,
+				metaFetcher,
+				dir,
+				noopCache{},
+				0,
+				0,
+				99,
+				false,
+				20,
+				allowAllFilterConf,
+				true)
+			testutil.Ok(t, err)
+
+			testutil.Ok(t, bucketStore.InitialSync(context.Background()))
+
+			// Check "stored" blocks.
+			ids := make([]ulid.ULID, 0, len(bucketStore.blocks))
+			for id := range bucketStore.blocks {
+				ids = append(ids, id)
+			}
+			sort.Slice(ids, func(i, j int) bool {
+				return ids[i].Compare(ids[j]) < 0
+			})
+			testutil.Equals(t, sc.expectedIDs, ids)
+
+			// Check Info endpoint.
+			resp, err := bucketStore.Info(context.Background(), &storepb.InfoRequest{})
+			testutil.Ok(t, err)
+
+			testutil.Equals(t, storepb.StoreType_STORE, resp.StoreType)
+			testutil.Equals(t, []storepb.Label(nil), resp.Labels)
+			testutil.Equals(t, sc.expectedAdvLabels, resp.LabelSets)
+
+			// Make sure we don't download files we did not expect to.
+			// Regression test: https://github.com/thanos-io/thanos/issues/1664
+
+			// Sort records. We load blocks concurrently so operations might be not ordered.
+			sort.Strings(rec.touched)
+
+			fmt.Println(cached, sc.expectedIDs, all, rec.touched)
+			if reuseDisk != "" {
+				testutil.Equals(t, expectedTouchedBlockOps(all, sc.expectedIDs, cached), rec.touched)
+				cached = sc.expectedIDs
+				return
+			}
+
+			testutil.Equals(t, expectedTouchedBlockOps(all, sc.expectedIDs, nil), rec.touched)
 		})
-		sort.Slice(ids, func(i, j int) bool {
-			return ids[i].Compare(ids[j]) > 0
-		})
-		testutil.Equals(t, sc.exceptedIds, ids)
 	}
 }
 
-func TestBucketStore_InfoWithLabels(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
+func expectedTouchedBlockOps(all []ulid.ULID, expected []ulid.ULID, cached []ulid.ULID) []string {
+	var ops []string
+	for _, id := range all {
+		blockCached := false
+		for _, fid := range cached {
+			if id.Compare(fid) == 0 {
+				blockCached = true
+				break
+			}
+		}
+		if blockCached {
+			continue
+		}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+		found := false
+		for _, fid := range expected {
+			if id.Compare(fid) == 0 {
+				found = true
+				break
+			}
+		}
 
-	dir, err := ioutil.TempDir("", "bucketstore-test")
-	testutil.Ok(t, err)
-
-	bkt := inmem.NewBucket()
-	series := []labels.Labels{labels.FromStrings("a", "1", "b", "1")}
-
-	logger := log.NewNopLogger()
-	id1, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "A"}}, 0)
-	testutil.Ok(t, err)
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id1.String(), block.IndexFilename), path.Join(id1.String(), block.IndexFilename)))
-
-	id2, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "B"}}, 0)
-	testutil.Ok(t, err)
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id2.String(), block.IndexFilename), path.Join(id2.String(), block.IndexFilename)))
-
-	id3, err := testutil.CreateBlock(ctx, dir, series, 10, 0, 1000, labels.Labels{{Name: "cluster", Value: "B"}}, 0)
-	testutil.Ok(t, err)
-	testutil.Ok(t, objstore.UploadFile(ctx, logger, bkt, filepath.Join(dir, id3.String(), block.IndexFilename), path.Join(id3.String(), block.IndexFilename)))
-
-	relabelContentYaml := `
-    - action: drop
-      regex: "A"
-      source_labels:
-      - cluster
-    `
-	var relabelConfig []*relabel.Config
-	err = yaml.Unmarshal([]byte(relabelContentYaml), &relabelConfig)
-	testutil.Ok(t, err)
-	bucketStore, err := NewBucketStore(
-		nil,
-		nil,
-		bkt,
-		dir,
-		noopCache{},
-		2e5,
-		0,
-		0,
-		false,
-		20,
-		filterConf,
-		relabelConfig,
-		true,
-	)
-	testutil.Ok(t, err)
-
-	err = bucketStore.SyncBlocks(ctx)
-	testutil.Ok(t, err)
-
-	resp, err := bucketStore.Info(ctx, &storepb.InfoRequest{})
-	testutil.Ok(t, err)
-
-	testutil.Equals(t, storepb.StoreType_STORE, resp.StoreType)
-	testutil.Equals(t, int64(0), resp.MinTime)
-	testutil.Equals(t, int64(1000), resp.MaxTime)
-	testutil.Equals(t, []storepb.Label(nil), resp.Labels)
-	testutil.Equals(t, []storepb.LabelSet{
-		{
-			Labels: []storepb.Label{
-				{Name: "cluster", Value: "B"},
-			},
-		},
-		{
-			Labels: []storepb.Label{
-				{Name: CompatibilityTypeLabelName, Value: "store"},
-			},
-		},
-	}, resp.LabelSets)
+		if found {
+			ops = append(ops,
+				path.Join(id.String(), block.IndexCacheFilename),
+				path.Join(id.String(), block.IndexFilename),
+			)
+		}
+	}
+	sort.Strings(ops)
+	return ops
 }
