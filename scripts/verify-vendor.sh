@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if grep "/vendor" .gitignore; then
+if grep "^/vendor" .gitignore; then
 	echo '"/vendor" directory found in .gitignore. Stopping as this breaks further checks'
 	exit 1
 fi
