@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package store
 
 import (
@@ -14,6 +17,8 @@ import (
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
+
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil"
@@ -33,7 +38,7 @@ func testPrometheusStoreSeriesE2e(t *testing.T, prefix string) {
 
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	p, err := testutil.NewPrometheusOnPath(prefix)
+	p, err := e2eutil.NewPrometheusOnPath(prefix)
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
 
@@ -185,7 +190,7 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	p, err := testutil.NewPrometheus()
+	p, err := e2eutil.NewPrometheus()
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
 
@@ -198,6 +203,8 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 	testutil.Ok(t, err)
 	_, err = a.Add(labels.FromStrings("a", "d", "job", "test"), baseT+300, 3)
 	testutil.Ok(t, err)
+	_, err = a.Add(labels.FromStrings("job", "test"), baseT+400, 4)
+	testutil.Ok(t, err)
 	testutil.Ok(t, a.Commit())
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -208,14 +215,13 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 	u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
 	testutil.Ok(t, err)
 
-	limitMinT := int64(0)
-	proxy, err := NewPrometheusStore(nil, nil, u, component.Sidecar,
+	promStore, err := NewPrometheusStore(nil, nil, u, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return limitMinT, -1 }) // Maxt does not matter.
+		func() (int64, int64) { return math.MinInt64/1000 + 62135596801, math.MaxInt64/1000 - 62135596801 })
 	testutil.Ok(t, err)
 
 	{
-		res, err := proxy.seriesLabels(ctx, []storepb.LabelMatcher{
+		res, err := promStore.seriesLabels(ctx, []storepb.LabelMatcher{
 			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "b"},
 		}, baseT, baseT+300)
 		testutil.Ok(t, err)
@@ -224,7 +230,7 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 		testutil.Equals(t, labels.FromMap(res[0]), labels.Labels{{Name: "a", Value: "b"}})
 	}
 	{
-		res, err := proxy.seriesLabels(ctx, []storepb.LabelMatcher{
+		res, err := promStore.seriesLabels(ctx, []storepb.LabelMatcher{
 			{Type: storepb.LabelMatcher_EQ, Name: "job", Value: "foo"},
 		}, baseT, baseT+300)
 		testutil.Ok(t, err)
@@ -232,7 +238,7 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 		testutil.Equals(t, len(res), 0)
 	}
 	{
-		res, err := proxy.seriesLabels(ctx, []storepb.LabelMatcher{
+		res, err := promStore.seriesLabels(ctx, []storepb.LabelMatcher{
 			{Type: storepb.LabelMatcher_NEQ, Name: "a", Value: "b"},
 			{Type: storepb.LabelMatcher_EQ, Name: "job", Value: "test"},
 		}, baseT, baseT+300)
@@ -246,7 +252,7 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 		}
 	}
 	{
-		res, err := proxy.seriesLabels(ctx, []storepb.LabelMatcher{
+		res, err := promStore.seriesLabels(ctx, []storepb.LabelMatcher{
 			{Type: storepb.LabelMatcher_EQ, Name: "job", Value: "test"},
 		}, baseT, baseT+300)
 		testutil.Ok(t, err)
@@ -258,12 +264,35 @@ func TestPrometheusStore_SeriesLabels_e2e(t *testing.T) {
 			testutil.Equals(t, labels.FromMap(r).Get("job"), "test")
 		}
 	}
+	{
+		res, err := promStore.seriesLabels(ctx, []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "job", Value: "test"},
+		}, baseT+400, baseT+400)
+		testutil.Ok(t, err)
+
+		// In baseT + 400 we can just get one series.
+		testutil.Equals(t, len(res), 1)
+		testutil.Equals(t, len(res[0]), 1)
+		testutil.Equals(t, labels.FromMap(res[0]).Get("job"), "test")
+	}
+	// This test case is to test when start time and end time is not specified.
+	{
+		minTime, maxTime := promStore.timestamps()
+		res, err := promStore.seriesLabels(ctx, []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "job", Value: "test"},
+		}, minTime, maxTime)
+		testutil.Ok(t, err)
+		testutil.Equals(t, len(res), 3)
+		for _, r := range res {
+			testutil.Equals(t, labels.FromMap(r).Get("job"), "test")
+		}
+	}
 }
 
 func TestPrometheusStore_LabelValues_e2e(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	p, err := testutil.NewPrometheus()
+	p, err := e2eutil.NewPrometheus()
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
 
@@ -299,7 +328,7 @@ func TestPrometheusStore_LabelValues_e2e(t *testing.T) {
 func TestPrometheusStore_ExternalLabelValues_e2e(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	p, err := testutil.NewPrometheus()
+	p, err := e2eutil.NewPrometheus()
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
 
@@ -339,7 +368,7 @@ func TestPrometheusStore_ExternalLabelValues_e2e(t *testing.T) {
 func TestPrometheusStore_Series_MatchExternalLabel_e2e(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	p, err := testutil.NewPrometheus()
+	p, err := e2eutil.NewPrometheus()
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
 
@@ -364,8 +393,7 @@ func TestPrometheusStore_Series_MatchExternalLabel_e2e(t *testing.T) {
 
 	proxy, err := NewPrometheusStore(nil, nil, u, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return 0, math.MaxInt64 },
-	)
+		func() (int64, int64) { return 0, math.MaxInt64 })
 	testutil.Ok(t, err)
 	srv := newStoreSeriesServer(ctx)
 
@@ -410,8 +438,7 @@ func TestPrometheusStore_Info(t *testing.T) {
 
 	proxy, err := NewPrometheusStore(nil, nil, nil, component.Sidecar,
 		func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-		func() (int64, int64) { return 123, 456 },
-	)
+		func() (int64, int64) { return 123, 456 })
 	testutil.Ok(t, err)
 
 	resp, err := proxy.Info(ctx, &storepb.InfoRequest{})
@@ -477,7 +504,7 @@ func testSeries_SplitSamplesIntoChunksWithMaxSizeOfUint16_e2e(t *testing.T, appe
 func TestPrometheusStore_Series_SplitSamplesIntoChunksWithMaxSizeOfUint16_e2e(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	p, err := testutil.NewPrometheus()
+	p, err := e2eutil.NewPrometheus()
 	testutil.Ok(t, err)
 	defer func() { testutil.Ok(t, p.Stop()) }()
 
@@ -489,8 +516,7 @@ func TestPrometheusStore_Series_SplitSamplesIntoChunksWithMaxSizeOfUint16_e2e(t 
 
 		proxy, err := NewPrometheusStore(nil, nil, u, component.Sidecar,
 			func() labels.Labels { return labels.FromStrings("region", "eu-west") },
-			func() (int64, int64) { return 0, math.MaxInt64 },
-		)
+			func() (int64, int64) { return 0, math.MaxInt64 })
 		testutil.Ok(t, err)
 
 		// We build chunks only for SAMPLES method. Make sure we ask for SAMPLES only.
