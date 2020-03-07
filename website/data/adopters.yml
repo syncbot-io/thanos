@@ -54,3 +54,39 @@ adopters:
 - name: Softonic
   url: https://www.softonic.com
   logo: softonic.png
+- name: BlaBlaCar
+  url: https://www.blablacar.com
+  logo: blablacar.png
+- name: FREE NOW
+  url: https://free-now.com
+  logo: free-now.png
+- name: Amadeus
+  url: https://amadeus.com
+  logo: amadeus.png
+- name: Grofers
+  url: https://grofers.com
+  logo: grofers.png
+- name: Tencent
+  url: https://github.com/tkestack/tke
+  logo: tencent.png
+- name: VEXXHOST, Inc.
+  url: https://vexxhost.com
+  logo: vexxhost.png
+- name: World Wide Technology
+  url: https://www.wwt.com
+  logo: wwt.png
+- name: Banzai Cloud
+  url: https://banzaicloud.com/
+  logo: banzaicloud.png
+- name: Jurumani Solutions
+  url: https://www.jurumani.co.za/
+  logo: jurumanisolutions.png
+- name: Tangent Solutions
+  url: https://www.tangentsolutions.co.za/
+  logo: tangentsolutions.png
+- name: Toss
+  url: https://toss.im/en
+  logo: toss.png
+- name: Ozon
+  url: https://www.ozon.ru
+  logo: ozon.png

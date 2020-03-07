@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package client
 
 import (
@@ -12,6 +15,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/thanos-io/thanos/pkg/tracing/elasticapm"
 	"github.com/thanos-io/thanos/pkg/tracing/jaeger"
+	"github.com/thanos-io/thanos/pkg/tracing/lightstep"
 	"github.com/thanos-io/thanos/pkg/tracing/stackdriver"
 	"gopkg.in/yaml.v2"
 )
@@ -22,6 +26,7 @@ const (
 	STACKDRIVER TracingProvider = "STACKDRIVER"
 	JAEGER      TracingProvider = "JAEGER"
 	ELASTIC_APM TracingProvider = "ELASTIC_APM"
+	LIGHTSTEP   TracingProvider = "LIGHTSTEP"
 )
 
 type TracingConfig struct {
@@ -53,6 +58,8 @@ func NewTracer(ctx context.Context, logger log.Logger, metrics *prometheus.Regis
 		return jaeger.NewTracer(ctx, logger, metrics, config)
 	case string(ELASTIC_APM):
 		return elasticapm.NewTracer(config)
+	case string(LIGHTSTEP):
+		return lightstep.NewTracer(ctx, config)
 	default:
 		return nil, nil, errors.Errorf("tracing with type %s is not supported", tracingConf.Type)
 	}

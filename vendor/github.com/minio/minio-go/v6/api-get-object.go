@@ -45,6 +45,14 @@ func (c Client) getObjectWithContext(ctx context.Context, bucketName, objectName
 		return nil, err
 	}
 
+	// Detect if snowball is server location we are talking to.
+	var snowball bool
+	if location, ok := c.bucketLocCache.Get(bucketName); ok {
+		if location == "snowball" {
+			snowball = true
+		}
+	}
+
 	var httpReader io.ReadCloser
 	var objectInfo ObjectInfo
 	var err error
@@ -92,7 +100,7 @@ func (c Client) getObjectWithContext(ctx context.Context, bucketName, objectName
 						} else if req.Offset > 0 {
 							opts.SetRange(req.Offset, 0)
 						}
-						httpReader, objectInfo, err = c.getObject(ctx, bucketName, objectName, opts)
+						httpReader, objectInfo, _, err = c.getObject(ctx, bucketName, objectName, opts)
 						if err != nil {
 							resCh <- getResponse{Error: err}
 							return
@@ -136,7 +144,10 @@ func (c Client) getObjectWithContext(ctx context.Context, bucketName, objectName
 				} else if req.settingObjectInfo { // Request is just to get objectInfo.
 					// Remove range header if already set, for stat Operations to get original file size.
 					delete(opts.headers, "Range")
-					if etag != "" {
+					// Check whether this is snowball
+					// if yes do not use If-Match feature
+					// it doesn't work.
+					if etag != "" && !snowball {
 						opts.SetMatchETag(etag)
 					}
 					objectInfo, err := c.statObject(ctx, bucketName, objectName, StatObjectOptions{opts})
@@ -159,7 +170,10 @@ func (c Client) getObjectWithContext(ctx context.Context, bucketName, objectName
 					// new ones when they haven't been already.
 					// All readAt requests are new requests.
 					if req.DidOffsetChange || !req.beenRead {
-						if etag != "" {
+						// Check whether this is snowball
+						// if yes do not use If-Match feature
+						// it doesn't work.
+						if etag != "" && !snowball {
 							opts.SetMatchETag(etag)
 						}
 						if httpReader != nil {
@@ -173,7 +187,7 @@ func (c Client) getObjectWithContext(ctx context.Context, bucketName, objectName
 						} else if req.Offset > 0 { // Range is set with respect to the offset.
 							opts.SetRange(req.Offset, 0)
 						}
-						httpReader, objectInfo, err = c.getObject(ctx, bucketName, objectName, opts)
+						httpReader, objectInfo, _, err = c.getObject(ctx, bucketName, objectName, opts)
 						if err != nil {
 							resCh <- getResponse{
 								Error: err,
@@ -321,6 +335,7 @@ func (o *Object) Read(b []byte) (n int, err error) {
 	if o.prevErr != nil || o.isClosed {
 		return 0, o.prevErr
 	}
+
 	// Create a new request.
 	readReq := getRequest{
 		isReadOp: true,
@@ -403,9 +418,12 @@ func (o *Object) ReadAt(b []byte, offset int64) (n int, err error) {
 	defer o.mutex.Unlock()
 
 	// prevErr is error which was saved in previous operation.
-	if o.prevErr != nil || o.isClosed {
+	if o.prevErr != nil && o.prevErr != io.EOF || o.isClosed {
 		return 0, o.prevErr
 	}
+
+	// Set the current offset to ReadAt offset, because the current offset will be shifted at the end of this method.
+	o.currOffset = offset
 
 	// Can only compare offsets to size when size has been set.
 	if o.objectInfoSet {
@@ -476,11 +494,9 @@ func (o *Object) Seek(offset int64, whence int) (n int64, err error) {
 	o.mutex.Lock()
 	defer o.mutex.Unlock()
 
-	if o.prevErr != nil {
-		// At EOF seeking is legal allow only io.EOF, for any other errors we return.
-		if o.prevErr != io.EOF {
-			return 0, o.prevErr
-		}
+	// At EOF seeking is legal allow only io.EOF, for any other errors we return.
+	if o.prevErr != nil && o.prevErr != io.EOF {
+		return 0, o.prevErr
 	}
 
 	// Negative offset is valid for whence of '2'.
@@ -594,13 +610,13 @@ func newObject(reqCh chan<- getRequest, resCh <-chan getResponse, doneCh chan<- 
 //
 // For more information about the HTTP Range header.
 // go to http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.35.
-func (c Client) getObject(ctx context.Context, bucketName, objectName string, opts GetObjectOptions) (io.ReadCloser, ObjectInfo, error) {
+func (c Client) getObject(ctx context.Context, bucketName, objectName string, opts GetObjectOptions) (io.ReadCloser, ObjectInfo, http.Header, error) {
 	// Validate input arguments.
 	if err := s3utils.CheckValidBucketName(bucketName); err != nil {
-		return nil, ObjectInfo{}, err
+		return nil, ObjectInfo{}, nil, err
 	}
 	if err := s3utils.CheckValidObjectName(objectName); err != nil {
-		return nil, ObjectInfo{}, err
+		return nil, ObjectInfo{}, nil, err
 	}
 
 	// Execute GET on objectName.
@@ -611,23 +627,22 @@ func (c Client) getObject(ctx context.Context, bucketName, objectName string, op
 		contentSHA256Hex: emptySHA256Hex,
 	})
 	if err != nil {
-		return nil, ObjectInfo{}, err
+		return nil, ObjectInfo{}, nil, err
 	}
 	if resp != nil {
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-			return nil, ObjectInfo{}, httpRespToErrorResponse(resp, bucketName, objectName)
+			return nil, ObjectInfo{}, nil, httpRespToErrorResponse(resp, bucketName, objectName)
 		}
 	}
 
 	// Trim off the odd double quotes from ETag in the beginning and end.
-	md5sum := strings.TrimPrefix(resp.Header.Get("ETag"), "\"")
-	md5sum = strings.TrimSuffix(md5sum, "\"")
+	md5sum := trimEtag(resp.Header.Get("ETag"))
 
 	// Parse the date.
 	date, err := time.Parse(http.TimeFormat, resp.Header.Get("Last-Modified"))
 	if err != nil {
 		msg := "Last-Modified time format not recognized. " + reportIssue
-		return nil, ObjectInfo{}, ErrorResponse{
+		return nil, ObjectInfo{}, nil, ErrorResponse{
 			Code:      "InternalError",
 			Message:   msg,
 			RequestID: resp.Header.Get("x-amz-request-id"),
@@ -655,5 +670,5 @@ func (c Client) getObject(ctx context.Context, bucketName, objectName string, op
 	}
 
 	// do not close body here, caller will close
-	return resp.Body, objectStat, nil
+	return resp.Body, objectStat, resp.Header, nil
 }

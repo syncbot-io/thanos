@@ -1,6 +1,6 @@
 /*
  * MinIO Go Library for Amazon S3 Compatible Cloud Storage
- * Copyright 2017 MinIO, Inc.
+ * Copyright 2017-2020 MinIO, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -89,11 +89,13 @@ type bucketMeta struct {
 
 // Notification event object metadata.
 type objectMeta struct {
-	Key       string `json:"key"`
-	Size      int64  `json:"size,omitempty"`
-	ETag      string `json:"eTag,omitempty"`
-	VersionID string `json:"versionId,omitempty"`
-	Sequencer string `json:"sequencer"`
+	Key          string            `json:"key"`
+	Size         int64             `json:"size,omitempty"`
+	ETag         string            `json:"eTag,omitempty"`
+	ContentType  string            `json:"contentType,omitempty"`
+	UserMetadata map[string]string `json:"userMetadata,omitempty"`
+	VersionID    string            `json:"versionId,omitempty"`
+	Sequencer    string            `json:"sequencer"`
 }
 
 // Notification event server specific metadata.
@@ -163,13 +165,14 @@ func (c Client) ListenBucketNotification(bucketName, prefix, suffix string, even
 		// Indicate to our routine to exit cleanly upon return.
 		defer close(retryDoneCh)
 
+		// Prepare urlValues to pass into the request on every loop
+		urlValues := make(url.Values)
+		urlValues.Set("prefix", prefix)
+		urlValues.Set("suffix", suffix)
+		urlValues["events"] = events
+
 		// Wait on the jitter retry loop.
 		for range c.newRetryTimerContinous(time.Second, time.Second*30, MaxJitter, retryDoneCh) {
-			urlValues := make(url.Values)
-			urlValues.Set("prefix", prefix)
-			urlValues.Set("suffix", suffix)
-			urlValues["events"] = events
-
 			// Execute GET on bucket to list objects.
 			resp, err := c.executeMethod(context.Background(), "GET", requestMetadata{
 				bucketName:       bucketName,
@@ -199,6 +202,11 @@ func (c Client) ListenBucketNotification(bucketName, prefix, suffix string, even
 			for bio.Scan() {
 				var notificationInfo NotificationInfo
 				if err = json.Unmarshal(bio.Bytes(), &notificationInfo); err != nil {
+					// Unexpected error during json unmarshal, send
+					// the error to caller for actionable as needed.
+					notificationInfoCh <- NotificationInfo{
+						Err: err,
+					}
 					closeResponse(resp)
 					continue
 				}
@@ -210,7 +218,11 @@ func (c Client) ListenBucketNotification(bucketName, prefix, suffix string, even
 					return
 				}
 			}
-
+			if err = bio.Err(); err != nil {
+				notificationInfoCh <- NotificationInfo{
+					Err: err,
+				}
+			}
 			// Close current connection before looping further.
 			closeResponse(resp)
 		}

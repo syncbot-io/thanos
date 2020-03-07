@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 // Package gcs implements common object storage abstractions against Google Cloud Storage.
 package gcs
 
@@ -5,11 +8,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/go-kit/kit/log"
@@ -19,7 +20,7 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 )
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
@@ -124,6 +125,15 @@ func (b *Bucket) GetRange(ctx context.Context, name string, off, length int64) (
 	return b.bkt.Object(name).NewRangeReader(ctx, off, length)
 }
 
+// ObjectSize returns the size of the specified object.
+func (b *Bucket) ObjectSize(ctx context.Context, name string) (uint64, error) {
+	obj, err := b.bkt.Object(name).Attrs(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return uint64(obj.Size), nil
+}
+
 // Handle returns the underlying GCS bucket handle.
 // Used for testing purposes (we return handle, so it is not instrumented).
 func (b *Bucket) Handle() *storage.BucketHandle {
@@ -169,9 +179,8 @@ func (b *Bucket) Close() error {
 func NewTestBucket(t testing.TB, project string) (objstore.Bucket, func(), error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	src := rand.NewSource(time.Now().UnixNano())
 	gTestConfig := Config{
-		Bucket: fmt.Sprintf("test_%s_%x", strings.ToLower(t.Name()), src.Int63()),
+		Bucket: objstore.CreateTemporaryTestBucketName(t),
 	}
 
 	bc, err := yaml.Marshal(gTestConfig)

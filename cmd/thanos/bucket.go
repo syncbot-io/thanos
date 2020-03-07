@@ -1,28 +1,17 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
 	"sort"
 	"strings"
 	"text/template"
 	"time"
-
-	"github.com/thanos-io/thanos/pkg/extflag"
-
-	"github.com/thanos-io/thanos/pkg/block"
-	"github.com/thanos-io/thanos/pkg/block/metadata"
-	"github.com/thanos-io/thanos/pkg/compact"
-	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
-	"github.com/thanos-io/thanos/pkg/objstore"
-	"github.com/thanos-io/thanos/pkg/objstore/client"
-	"github.com/thanos-io/thanos/pkg/runutil"
-	"github.com/thanos-io/thanos/pkg/ui"
-	"github.com/thanos-io/thanos/pkg/verifier"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -33,11 +22,27 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/tsdb/labels"
+	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/extflag"
+	"github.com/thanos-io/thanos/pkg/extprom"
+	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/objstore/client"
+	"github.com/thanos-io/thanos/pkg/prober"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	httpserver "github.com/thanos-io/thanos/pkg/server/http"
+	"github.com/thanos-io/thanos/pkg/ui"
+	"github.com/thanos-io/thanos/pkg/verifier"
 	"golang.org/x/text/language"
 	"golang.org/x/text/message"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
+
+const extpromPrefix = "thanos_bucket_"
 
 var (
 	issuesMap = map[string]verifier.Issue{
@@ -75,7 +80,7 @@ func registerBucketVerify(m map[string]setupFunc, root *kingpin.CmdClause, name 
 		Short('i').Default(verifier.IndexIssueID, verifier.OverlappedBlocksIssueID).Strings()
 	idWhitelist := cmd.Flag("id-whitelist", "Block IDs to verify (and optionally repair) only. "+
 		"If none is specified, all blocks will be verified. Repeated field").Strings()
-	m[name+" verify"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
+	m[name+" verify"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		confContentYaml, err := objStoreConfig.Content()
 		if err != nil {
 			return err
@@ -124,10 +129,15 @@ func registerBucketVerify(m map[string]setupFunc, root *kingpin.CmdClause, name 
 			issues = append(issues, issueFn)
 		}
 
+		fetcher, err := block.NewMetaFetcher(logger, fetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
+		if err != nil {
+			return err
+		}
+
 		if *repair {
-			v = verifier.NewWithRepair(logger, bkt, backupBkt, issues)
+			v = verifier.NewWithRepair(logger, bkt, backupBkt, fetcher, issues)
 		} else {
-			v = verifier.New(logger, bkt, issues)
+			v = verifier.New(logger, bkt, fetcher, issues)
 		}
 
 		var idMatcher func(ulid.ULID) bool = nil
@@ -157,13 +167,18 @@ func registerBucketLs(m map[string]setupFunc, root *kingpin.CmdClause, name stri
 	cmd := root.Command("ls", "List all blocks in the bucket")
 	output := cmd.Flag("output", "Optional format in which to print each block's information. Options are 'json', 'wide' or a custom template.").
 		Short('o').Default("").String()
-	m[name+" ls"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
+	m[name+" ls"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		confContentYaml, err := objStoreConfig.Content()
 		if err != nil {
 			return err
 		}
 
 		bkt, err := client.NewBucket(logger, confContentYaml, reg, name)
+		if err != nil {
+			return err
+		}
+
+		fetcher, err := block.NewMetaFetcher(logger, fetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
 		if err != nil {
 			return err
 		}
@@ -178,22 +193,18 @@ func registerBucketLs(m map[string]setupFunc, root *kingpin.CmdClause, name stri
 
 		var (
 			format     = *output
-			printBlock func(id ulid.ULID) error
+			objects    = 0
+			printBlock func(m *metadata.Meta) error
 		)
 
 		switch format {
 		case "":
-			printBlock = func(id ulid.ULID) error {
-				fmt.Fprintln(os.Stdout, id.String())
+			printBlock = func(m *metadata.Meta) error {
+				fmt.Fprintln(os.Stdout, m.ULID.String())
 				return nil
 			}
 		case "wide":
-			printBlock = func(id ulid.ULID) error {
-				m, err := block.DownloadMeta(ctx, logger, bkt, id)
-				if err != nil {
-					return err
-				}
-
+			printBlock = func(m *metadata.Meta) error {
 				minTime := time.Unix(m.MinTime/1000, 0)
 				maxTime := time.Unix(m.MaxTime/1000, 0)
 
@@ -208,11 +219,7 @@ func registerBucketLs(m map[string]setupFunc, root *kingpin.CmdClause, name stri
 			enc := json.NewEncoder(os.Stdout)
 			enc.SetIndent("", "\t")
 
-			printBlock = func(id ulid.ULID) error {
-				m, err := block.DownloadMeta(ctx, logger, bkt, id)
-				if err != nil {
-					return err
-				}
+			printBlock = func(m *metadata.Meta) error {
 				return enc.Encode(&m)
 			}
 		default:
@@ -220,12 +227,7 @@ func registerBucketLs(m map[string]setupFunc, root *kingpin.CmdClause, name stri
 			if err != nil {
 				return errors.Wrap(err, "invalid template")
 			}
-			printBlock = func(id ulid.ULID) error {
-				m, err := block.DownloadMeta(ctx, logger, bkt, id)
-				if err != nil {
-					return err
-				}
-
+			printBlock = func(m *metadata.Meta) error {
 				if err := tmpl.Execute(os.Stdout, &m); err != nil {
 					return errors.Wrap(err, "execute template")
 				}
@@ -234,13 +236,19 @@ func registerBucketLs(m map[string]setupFunc, root *kingpin.CmdClause, name stri
 			}
 		}
 
-		return bkt.Iter(ctx, "", func(name string) error {
-			id, ok := block.IsBlockDir(name)
-			if !ok {
-				return nil
+		metas, _, err := fetcher.Fetch(ctx)
+		if err != nil {
+			return err
+		}
+
+		for _, meta := range metas {
+			objects++
+			if err := printBlock(meta); err != nil {
+				return errors.Wrap(err, "iter")
 			}
-			return printBlock(id)
-		})
+		}
+		level.Info(logger).Log("msg", "ls done", "objects", objects)
+		return nil
 	}
 }
 
@@ -252,7 +260,7 @@ func registerBucketInspect(m map[string]setupFunc, root *kingpin.CmdClause, name
 		Default("FROM", "UNTIL").Enums(inspectColumns...)
 	timeout := cmd.Flag("timeout", "Timeout to download metadata from remote storage").Default("5m").Duration()
 
-	m[name+" inspect"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
+	m[name+" inspect"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 
 		// Parse selector.
 		selectorLabels, err := parseFlagLabels(*selector)
@@ -270,6 +278,11 @@ func registerBucketInspect(m map[string]setupFunc, root *kingpin.CmdClause, name
 			return err
 		}
 
+		fetcher, err := block.NewMetaFetcher(logger, fetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
+		if err != nil {
+			return err
+		}
+
 		// Dummy actor to immediately kill the group after the run function returns.
 		g.Add(func() error { return nil }, func(error) {})
 
@@ -279,23 +292,14 @@ func registerBucketInspect(m map[string]setupFunc, root *kingpin.CmdClause, name
 		defer cancel()
 
 		// Getting Metas.
-		var blockMetas []*metadata.Meta
-		if err = bkt.Iter(ctx, "", func(name string) error {
-			id, ok := block.IsBlockDir(name)
-			if !ok {
-				return nil
-			}
-
-			m, err := block.DownloadMeta(ctx, logger, bkt, id)
-			if err != nil {
-				return err
-			}
-
-			blockMetas = append(blockMetas, &m)
-
-			return nil
-		}); err != nil {
+		metas, _, err := fetcher.Fetch(ctx)
+		if err != nil {
 			return err
+		}
+
+		blockMetas := make([]*metadata.Meta, 0, len(metas))
+		for _, meta := range metas {
+			blockMetas = append(blockMetas, meta)
 		}
 
 		return printTable(blockMetas, selectorLabels, *sortBy)
@@ -305,17 +309,38 @@ func registerBucketInspect(m map[string]setupFunc, root *kingpin.CmdClause, name
 // registerBucketWeb exposes a web interface for the state of remote store like `pprof web`.
 func registerBucketWeb(m map[string]setupFunc, root *kingpin.CmdClause, name string, objStoreConfig *extflag.PathOrContent) {
 	cmd := root.Command("web", "Web interface for remote storage bucket")
-	bind := cmd.Flag("listen", "HTTP host:port to listen on").Default("0.0.0.0:8080").String()
+	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
+	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the bucket web UI interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos bucket web UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
+	webPrefixHeaderName := cmd.Flag("web.prefix-header", "Name of HTTP request header used for dynamic prefixing of UI links and redirects. This option is ignored if web.external-prefix argument is set. Security risk: enable this option only if a reverse proxy in front of thanos is resetting the header. The --web.prefix-header=X-Forwarded-Prefix option can be useful, for example, if Thanos UI is served via Traefik reverse proxy with PathPrefixStrip option enabled, which sends the stripped prefix value in X-Forwarded-Prefix header. This allows thanos UI to be served on a sub-path.").Default("").String()
 	interval := cmd.Flag("refresh", "Refresh interval to download metadata from remote storage").Default("30m").Duration()
 	timeout := cmd.Flag("timeout", "Timeout to download metadata from remote storage").Default("5m").Duration()
 	label := cmd.Flag("label", "Prometheus label to use as timeline title").String()
 
-	m[name+" web"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ bool) error {
+	m[name+" web"] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		ctx, cancel := context.WithCancel(context.Background())
 
+		comp := component.Bucket
+		httpProbe := prober.NewHTTP()
+		statusProber := prober.Combine(
+			httpProbe,
+			prober.NewInstrumentation(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg)),
+		)
+
+		srv := httpserver.New(logger, reg, comp, httpProbe,
+			httpserver.WithListen(*httpBindAddr),
+			httpserver.WithGracePeriod(time.Duration(*httpGracePeriod)),
+		)
+
+		flagsMap := map[string]string{
+			"web.external-prefix": *webExternalPrefix,
+			"web.prefix-header":   *webPrefixHeaderName,
+		}
+
 		router := route.New()
-		bucketUI := ui.NewBucketUI(logger, *label)
-		bucketUI.Register(router, extpromhttp.NewInstrumentationMiddleware(reg))
+
+		bucketUI := ui.NewBucketUI(logger, *label, flagsMap)
+		bucketUI.Register(router.WithPrefix(*webExternalPrefix), extpromhttp.NewInstrumentationMiddleware(reg))
+		srv.Handle("/", router)
 
 		if *interval < 5*time.Minute {
 			level.Warn(logger).Log("msg", "Refreshing more often than 5m could lead to large data transfers")
@@ -330,21 +355,22 @@ func registerBucketWeb(m map[string]setupFunc, root *kingpin.CmdClause, name str
 		}
 
 		g.Add(func() error {
+			statusProber.Ready()
+
 			return refresh(ctx, logger, bucketUI, *interval, *timeout, name, reg, objStoreConfig)
 		}, func(error) {
 			cancel()
 		})
 
-		l, err := net.Listen("tcp", *bind)
-		if err != nil {
-			return errors.Wrapf(err, "listen HTTP on address %s", *bind)
-		}
-
 		g.Add(func() error {
-			level.Info(logger).Log("msg", "Listening for query and metrics", "address", *bind)
-			return errors.Wrap(http.Serve(l, router), "serve web")
-		}, func(error) {
-			runutil.CloseWithLogOnErr(logger, l, "http listener")
+			statusProber.Healthy()
+
+			return srv.ListenAndServe()
+		}, func(err error) {
+			statusProber.NotReady(err)
+			defer statusProber.NotHealthy(err)
+
+			srv.Shutdown(err)
 		})
 
 		return nil
@@ -363,13 +389,18 @@ func refresh(ctx context.Context, logger log.Logger, bucketUI *ui.Bucket, durati
 		return errors.Wrap(err, "bucket client")
 	}
 
+	fetcher, err := block.NewMetaFetcher(logger, fetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
+	if err != nil {
+		return err
+	}
+
 	defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
 	return runutil.Repeat(duration, ctx.Done(), func() error {
 		return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
 			iterCtx, iterCancel := context.WithTimeout(ctx, timeout)
 			defer iterCancel()
 
-			blocks, err := download(iterCtx, logger, bkt)
+			blocks, err := download(iterCtx, logger, bkt, fetcher)
 			if err != nil {
 				bucketUI.Set("[]", err)
 				return err
@@ -386,25 +417,16 @@ func refresh(ctx context.Context, logger log.Logger, bucketUI *ui.Bucket, durati
 	})
 }
 
-func download(ctx context.Context, logger log.Logger, bkt objstore.Bucket) (blocks []metadata.Meta, err error) {
+func download(ctx context.Context, logger log.Logger, bkt objstore.Bucket, fetcher *block.MetaFetcher) (blocks []metadata.Meta, err error) {
 	level.Info(logger).Log("msg", "synchronizing block metadata")
 
-	if err = bkt.Iter(ctx, "", func(name string) error {
-		id, ok := block.IsBlockDir(name)
-		if !ok {
-			return nil
-		}
+	metas, _, err := fetcher.Fetch(ctx)
+	if err != nil {
+		return nil, err
+	}
 
-		meta, err := block.DownloadMeta(ctx, logger, bkt, id)
-		if err != nil {
-			return err
-		}
-
-		blocks = append(blocks, meta)
-		return nil
-	}); err != nil {
-		level.Error(logger).Log("err", err, "msg", "Failed to downloaded block metadata")
-		return blocks, err
+	for _, meta := range metas {
+		blocks = append(blocks, *meta)
 	}
 
 	level.Info(logger).Log("msg", "downloaded blocks meta.json", "num", len(blocks))

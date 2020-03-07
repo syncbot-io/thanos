@@ -1,15 +1,18 @@
 ---
-title: Compact
+title: Compactor
 type: docs
 menu: components
 ---
 
-# Compact
+# Compactor
 
 The compactor component of Thanos applies the compaction procedure of the Prometheus 2.0 storage engine to block data stored in object storage.
 It is generally not semantically concurrency safe and must be deployed as a singleton against a bucket.
 
-It is also responsible for downsampling of data - performing 5m downsampling after **40 hours** and 1h downsampling after **10 days**.
+It is also responsible for downsampling of data:
+
+* creating 5m downsampling for blocks larger than **40 hours** (2d, 2w)
+* creating 1h downsampling for blocks larger than **10 days** (2w).
 
 Example:
 
@@ -44,14 +47,16 @@ There's also a case when you might want to disable downsampling at all with `deb
 
 Ideally, you will have equal retention set (or no retention at all) to all resolutions which allow both "zoom in" capabilities as well as performant long ranges queries. Since object storages are usually quite cheap, storage size might not matter that much, unless your goal with thanos is somewhat very specific and you know exactly what you're doing.
 
+Not setting this flag, or setting it to `0d`, i.e. `--retention.resolution-X=0d`, will mean that samples at the `X` resolution level will be kept forever.
+
 ## Storage space consumption
 
 In fact, downsampling doesn't save you any space but instead it adds 2 more blocks for each raw block which are only slightly smaller or relatively similar size to raw block. This is required by internal downsampling implementation which to be mathematically correct holds various aggregations. This means that downsampling can increase the size of your storage a bit (~3x), but it gives massive advantage on querying long ranges.
 
 ## Groups
 
-The compactor groups blocks using the [external_labels](https://thanos.io/getting-started.md/#external-labels) added by the
-Prometheus who produced the block. The labels must be both _unique_ and _persistent_ across different Prometheus instances.
+The compactor groups blocks using the external_labels added by the Prometheus who produced the block.
+The labels must be both _unique_ and _persistent_ across different Prometheus instances.
 
 By _unique_, we mean that the set of labels in a Prometheus instance must be different from all other sets of labels of
 your Prometheus instances, so that the compactor will be able to group blocks by Prometheus instance.
@@ -72,7 +77,8 @@ Flags:
                                and --help-man).
       --version                Show application version.
       --log.level=info         Log filtering level.
-      --log.format=logfmt      Log format to use.
+      --log.format=logfmt      Log format to use. Possible options: logfmt or
+                               json.
       --tracing.config-file=<file-path>
                                Path to YAML file with tracing configuration. See
                                format details:
@@ -84,6 +90,8 @@ Flags:
                                https://thanos.io/tracing.md/#configuration
       --http-address="0.0.0.0:10902"
                                Listen host:port for HTTP endpoints.
+      --http-grace-period=2m   Time to wait after an interrupt received for HTTP
+                               Server.
       --data-dir="./data"      Data directory in which to cache blocks and
                                process compactions.
       --objstore.config-file=<file-path>
@@ -98,16 +106,19 @@ Flags:
       --consistency-delay=30m  Minimum age of fresh (non-compacted) blocks
                                before they are being processed. Malformed blocks
                                older than the maximum of consistency-delay and
-                               30m0s will be removed.
+                               48h0m0s will be removed.
       --retention.resolution-raw=0d
-                               How long to retain raw samples in bucket. 0d -
-                               disables this retention
+                               How long to retain raw samples in bucket. Setting
+                               this to 0d will retain samples of this resolution
+                               forever
       --retention.resolution-5m=0d
                                How long to retain samples of resolution 1 (5
-                               minutes) in bucket. 0d - disables this retention
+                               minutes) in bucket. Setting this to 0d will
+                               retain samples of this resolution forever
       --retention.resolution-1h=0d
                                How long to retain samples of resolution 2 (1
-                               hour) in bucket. 0d - disables this retention
+                               hour) in bucket. Setting this to 0d will retain
+                               samples of this resolution forever
   -w, --wait                   Do not exit after all compactions have been
                                processed and wait for new work.
       --downsampling.disable   Disables downsampling. This is not recommended as

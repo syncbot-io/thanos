@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 // Copyright 2016 The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,54 +39,54 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
-	tsdb_labels "github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/component"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/query"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
 func TestEndpoints(t *testing.T) {
 	defer leaktest.CheckTimeout(t, 10*time.Second)()
 
-	lbls := []tsdb_labels.Labels{
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric1"},
-			tsdb_labels.Label{Name: "foo", Value: "bar"},
+	lbls := []labels.Labels{
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric1"},
+			labels.Label{Name: "foo", Value: "bar"},
 		},
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric1"},
-			tsdb_labels.Label{Name: "foo", Value: "boo"},
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric1"},
+			labels.Label{Name: "foo", Value: "boo"},
 		},
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric2"},
-			tsdb_labels.Label{Name: "foo", Value: "boo"},
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric2"},
+			labels.Label{Name: "foo", Value: "boo"},
 		},
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			tsdb_labels.Label{Name: "foo", Value: "bar"},
-			tsdb_labels.Label{Name: "replica", Value: "a"},
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
+			labels.Label{Name: "foo", Value: "bar"},
+			labels.Label{Name: "replica", Value: "a"},
 		},
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			tsdb_labels.Label{Name: "foo", Value: "boo"},
-			tsdb_labels.Label{Name: "replica", Value: "a"},
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
+			labels.Label{Name: "foo", Value: "boo"},
+			labels.Label{Name: "replica", Value: "a"},
 		},
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			tsdb_labels.Label{Name: "foo", Value: "boo"},
-			tsdb_labels.Label{Name: "replica", Value: "b"},
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
+			labels.Label{Name: "foo", Value: "boo"},
+			labels.Label{Name: "replica", Value: "b"},
 		},
-		tsdb_labels.Labels{
-			tsdb_labels.Label{Name: "__name__", Value: "test_metric_replica1"},
-			tsdb_labels.Label{Name: "foo", Value: "boo"},
-			tsdb_labels.Label{Name: "replica1", Value: "a"},
+		labels.Labels{
+			labels.Label{Name: "__name__", Value: "test_metric_replica1"},
+			labels.Label{Name: "foo", Value: "boo"},
+			labels.Label{Name: "replica1", Value: "a"},
 		},
 	}
 
-	db, err := testutil.NewTSDB()
+	db, err := e2eutil.NewTSDB()
 	defer func() { testutil.Ok(t, db.Close()) }()
 	testutil.Ok(t, err)
 
@@ -1077,9 +1080,8 @@ func BenchmarkQueryResultEncoding(b *testing.B) {
 	}
 	b.ResetTimer()
 
-	c, err := json.Marshal(&input)
+	_, err := json.Marshal(&input)
 	testutil.Ok(b, err)
-	fmt.Println(len(c))
 }
 
 func TestParseDownsamplingParamMillis(t *testing.T) {

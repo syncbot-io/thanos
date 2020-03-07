@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 // Package shipper detects directories on the local file system and uploads
 // them to a block storage.
 package shipper
@@ -17,9 +20,9 @@ import (
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/objstore"
@@ -39,7 +42,7 @@ func newMetrics(r prometheus.Registerer, uploadCompacted bool) *metrics {
 
 	m.dirSyncs = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "thanos_shipper_dir_syncs_total",
-		Help: "Total dir sync attempts",
+		Help: "Total number of dir syncs",
 	})
 	m.dirSyncFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "thanos_shipper_dir_sync_failures_total",
@@ -47,11 +50,11 @@ func newMetrics(r prometheus.Registerer, uploadCompacted bool) *metrics {
 	})
 	m.uploads = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "thanos_shipper_uploads_total",
-		Help: "Total object upload attempts",
+		Help: "Total number of uploaded blocks",
 	})
 	m.uploadFailures = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "thanos_shipper_upload_failures_total",
-		Help: "Total number of failed object uploads",
+		Help: "Total number of block upload failures",
 	})
 	m.uploadedCompacted = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "thanos_shipper_upload_compacted_done",
@@ -208,7 +211,7 @@ func (c *lazyOverlapChecker) sync(ctx context.Context) error {
 			return err
 		}
 
-		if !labels.FromMap(m.Thanos.Labels).Equals(c.labels()) {
+		if !labels.Equal(labels.FromMap(m.Thanos.Labels), c.labels()) {
 			return nil
 		}
 
@@ -380,10 +383,12 @@ func (s *Shipper) upload(ctx context.Context, meta *metadata.Meta) error {
 	return block.Upload(ctx, s.logger, s.bucket, updir)
 }
 
-// iterBlockMetas calls f with the block meta for each block found in dir. It logs
-// an error and continues if it cannot access a meta.json file.
+// iterBlockMetas calls f with the block meta for each block found in dir
+// sorted by minTime asc. It logs an error and continues if it cannot access a
+// meta.json file.
 // If f returns an error, the function returns with the same error.
 func (s *Shipper) iterBlockMetas(f func(m *metadata.Meta) error) error {
+	var metas []*metadata.Meta
 	names, err := fileutil.ReadDir(s.dir)
 	if err != nil {
 		return errors.Wrap(err, "read dir")
@@ -407,6 +412,13 @@ func (s *Shipper) iterBlockMetas(f func(m *metadata.Meta) error) error {
 			level.Warn(s.logger).Log("msg", "reading meta file failed", "err", err)
 			continue
 		}
+		metas = append(metas, m)
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].BlockMeta.MinTime < metas[j].BlockMeta.MinTime
+	})
+	for _, m := range metas {
+
 		if err := f(m); err != nil {
 			return err
 		}

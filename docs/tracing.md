@@ -13,7 +13,7 @@ All clients are configured using `--tracing.config-file` to reference to the con
 
 ## How to use `config` flags?
 
-You can either pass YAML file defined below in `--tracing.config-file` or pass the YAML content directly using `--tracing.config`. 
+You can either pass YAML file defined below in `--tracing.config-file` or pass the YAML content directly using `--tracing.config`.
 We recommend the latter as it gives an explicit static view of configuration for each component. It also saves you the fuss of creating and managing additional file.
 
 Don't be afraid of multiline flags!
@@ -46,7 +46,7 @@ In Kubernetes it is as easy as (on Thanos sidecar example):
 
 At that point, anyone can use your provider by spec.
 
-## Configuration 
+## Configuration
 
 Current tracing supported backends:
 
@@ -100,4 +100,24 @@ config:
   service_name: ""
   service_version: ""
   service_environment: ""
+  sample_rate: 0
+```
+
+### Lightstep
+
+Client for [Ligthstep](https://lightstep.com).
+
+In order to configure Thanos to interact with Lightstep you need to provide at least an [access token](https://docs.lightstep.com/docs/create-and-use-access-tokens) in the configuration file. The `collector` key is optional and used when you have on-premise satellites.
+
+[embedmd]:# (flags/config_tracing_lightstep.txt yaml)
+```yaml
+type: LIGHTSTEP
+config:
+  access_token: ""
+  collector:
+    scheme: ""
+    host: ""
+    port: 0
+    plaintext: false
+    custom_ca_cert_file: ""
 ```

@@ -1,22 +1,24 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package cos
 
 import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/go-kit/kit/log"
-	cos "github.com/mozillazg/go-cos"
+	"github.com/mozillazg/go-cos"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 )
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
@@ -88,6 +90,25 @@ func NewBucket(logger log.Logger, conf []byte, component string) (*Bucket, error
 // Name returns the bucket name for COS.
 func (b *Bucket) Name() string {
 	return b.name
+}
+
+// ObjectSize returns the size of the specified object.
+func (b *Bucket) ObjectSize(ctx context.Context, name string) (uint64, error) {
+	resp, err := b.client.Object.Head(ctx, name, nil)
+	if err != nil {
+		return 0, err
+	}
+	if v, ok := resp.Header["Content-Length"]; ok {
+		if len(v) == 0 {
+			return 0, errors.New("content-length header has no values")
+		}
+		ret, err := strconv.ParseUint(v[0], 10, 64)
+		if err != nil {
+			return 0, errors.Wrap(err, "convert content-length")
+		}
+		return ret, nil
+	}
+	return 0, errors.New("content-length header not found")
 }
 
 // Upload the contents of the reader as an object into the bucket.
@@ -311,14 +332,7 @@ func NewTestBucket(t testing.TB) (objstore.Bucket, func(), error) {
 		t.Log("WARNING. Reusing", c.Bucket, "COS bucket for COS tests. Manual cleanup afterwards is required")
 		return b, func() {}, nil
 	}
-
-	src := rand.NewSource(time.Now().UnixNano())
-
-	tmpBucketName := strings.Replace(fmt.Sprintf("test_%x", src.Int63()), "_", "-", -1)
-	if len(tmpBucketName) >= 31 {
-		tmpBucketName = tmpBucketName[:31]
-	}
-	c.Bucket = tmpBucketName
+	c.Bucket = objstore.CreateTemporaryTestBucketName(t)
 
 	bc, err := yaml.Marshal(c)
 	if err != nil {
@@ -333,12 +347,12 @@ func NewTestBucket(t testing.TB) (objstore.Bucket, func(), error) {
 	if _, err := b.client.Bucket.Put(context.Background(), nil); err != nil {
 		return nil, nil, err
 	}
-	t.Log("created temporary COS bucket for COS tests with name", tmpBucketName)
+	t.Log("created temporary COS bucket for COS tests with name", c.Bucket)
 
 	return b, func() {
 		objstore.EmptyBucket(t, context.Background(), b)
 		if _, err := b.client.Bucket.Delete(context.Background()); err != nil {
-			t.Logf("deleting bucket %s failed: %s", tmpBucketName, err)
+			t.Logf("deleting bucket %s failed: %s", c.Bucket, err)
 		}
 	}, nil
 }

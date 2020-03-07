@@ -1,9 +1,15 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package receive
 
 import (
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/go-kit/kit/log"
+	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/storage/tsdb"
@@ -67,29 +73,33 @@ func (f *FlushableStorage) open() error {
 }
 
 // Flush temporarily stops the storage and flushes the WAL to blocks.
-// Note: this operation leaves the storage in the same state it was in.
+// Note: this operation leaves the storage closed.
 func (f *FlushableStorage) Flush() error {
+	_, err := os.Stat(filepath.Join(f.path, "wal"))
+	if os.IsNotExist(err) {
+		level.Info(f.l).Log("msg", "No WAL was found for flushing; ignoring.")
+		return nil
+	}
+	if err != nil {
+		return errors.Wrap(err, "stating WAL")
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	var reopen bool
 	if !f.stopped {
 		if err := f.DB.Close(); err != nil {
 			return errors.Wrap(err, "stopping storage")
 		}
 		f.stopped = true
-		reopen = true
 	}
-	ro, err := promtsdb.OpenDBReadOnly(f.Dir(), f.l)
+	ro, err := promtsdb.OpenDBReadOnly(f.path, f.l)
 	if err != nil {
 		return errors.Wrap(err, "opening read-only DB")
 	}
-	if err := ro.FlushWAL(f.Dir()); err != nil {
+	defer ro.Close()
+	if err := ro.FlushWAL(f.path); err != nil {
 		return errors.Wrap(err, "flushing WAL")
 	}
-	if reopen {
-		return errors.Wrap(f.open(), "re-starting storage")
-	}
-	return nil
+	return errors.Wrap(os.RemoveAll(filepath.Join(f.path, "wal")), "removing stale WAL")
 }
 
 // Close stops the storage.

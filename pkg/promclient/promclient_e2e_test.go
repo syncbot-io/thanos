@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package promclient
 
 import (
@@ -13,27 +16,28 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/oklog/ulid"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
 
-func TestIsWALFileAccesible_e2e(t *testing.T) {
-	testutil.ForeachPrometheus(t, func(t testing.TB, p *testutil.Prometheus) {
+func TestIsWALFileAccessible_e2e(t *testing.T) {
+	e2eutil.ForeachPrometheus(t, func(t testing.TB, p *e2eutil.Prometheus) {
 		testutil.Ok(t, p.Start())
 
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
 		defer cancel()
-		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error { return IsWALDirAccesible(p.Dir()) }))
+		testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error { return IsWALDirAccessible(p.Dir()) }))
 
-		testutil.NotOk(t, IsWALDirAccesible(path.Join(p.Dir(), "/non-existing")))
-		testutil.NotOk(t, IsWALDirAccesible(path.Join(p.Dir(), "/../")))
+		testutil.NotOk(t, IsWALDirAccessible(path.Join(p.Dir(), "/non-existing")))
+		testutil.NotOk(t, IsWALDirAccessible(path.Join(p.Dir(), "/../")))
 	})
 }
 
 func TestExternalLabels_e2e(t *testing.T) {
-	testutil.ForeachPrometheus(t, func(t testing.TB, p *testutil.Prometheus) {
+	e2eutil.ForeachPrometheus(t, func(t testing.TB, p *e2eutil.Prometheus) {
 		testutil.Ok(t, p.SetConfig(`
 global:
   external_labels:
@@ -56,7 +60,7 @@ global:
 }
 
 func TestConfiguredFlags_e2e(t *testing.T) {
-	testutil.ForeachPrometheus(t, func(t testing.TB, p *testutil.Prometheus) {
+	e2eutil.ForeachPrometheus(t, func(t testing.TB, p *e2eutil.Prometheus) {
 		testutil.Ok(t, p.Start())
 
 		u, err := url.Parse(fmt.Sprintf("http://%s", p.Addr()))
@@ -75,12 +79,12 @@ func TestConfiguredFlags_e2e(t *testing.T) {
 }
 
 func TestSnapshot_e2e(t *testing.T) {
-	testutil.ForeachPrometheus(t, func(t testing.TB, p *testutil.Prometheus) {
+	e2eutil.ForeachPrometheus(t, func(t testing.TB, p *e2eutil.Prometheus) {
 		now := time.Now()
 
 		ctx := context.Background()
 		// Create artificial block.
-		id, err := testutil.CreateBlockWithTombstone(
+		id, err := e2eutil.CreateBlockWithTombstone(
 			ctx,
 			p.Dir(),
 			[]labels.Labels{labels.FromStrings("a", "b")},

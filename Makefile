@@ -5,6 +5,10 @@ DOCKER_IMAGE_REPO ?= quay.io/thanos/thanos
 DOCKER_IMAGE_TAG  ?= $(subst /,-,$(shell git rev-parse --abbrev-ref HEAD))-$(shell date +%Y-%m-%d)-$(shell git rev-parse --short HEAD)
 DOCKER_CI_TAG     ?= test
 
+# Ensure everything works even if GOPATH is not set, which is often the case.
+# The `go env GOPATH` will work for all cases for Go 1.8+.
+GOPATH            ?= $(shell go env GOPATH)
+
 TMP_GOPATH        ?= /tmp/thanos-go
 GOBIN             ?= $(firstword $(subst :, ,${GOPATH}))/bin
 GO111MODULE       ?= on
@@ -37,6 +41,25 @@ GOLANGCILINT         ?= $(GOBIN)/golangci-lint-$(GOLANGCILINT_VERSION)
 MISSPELL_VERSION     ?= c0b55c8239520f6b5aa15a0207ca8b28027ba49e
 MISSPELL             ?= $(GOBIN)/misspell-$(MISSPELL_VERSION)
 
+GOJSONTOYAML_VERSION    ?= e8bd32d46b3d764bef60f12b3bada1c132c4be55
+GOJSONTOYAML            ?= $(GOBIN)/gojsontoyaml-$(GOJSONTOYAML_VERSION)
+# v0.14.0
+JSONNET_VERSION         ?= fbde25be2182caa4345b03f1532450911ac7d1f3
+JSONNET                 ?= $(GOBIN)/jsonnet-$(JSONNET_VERSION)
+JSONNET_BUNDLER_VERSION ?= efe0c9e864431e93d5c3376bd5931d0fb9b2a296
+JSONNET_BUNDLER         ?= $(GOBIN)/jb-$(JSONNET_BUNDLER_VERSION)
+# Prometheus v2.14.0
+PROMTOOL_VERSION        ?= edeb7a44cbf745f1d8be4ea6f215e79e651bfe19
+PROMTOOL                ?= $(GOBIN)/promtool-$(PROMTOOL_VERSION)
+
+# Support gsed on OSX (installed via brew), falling back to sed. On Linux
+# systems gsed won't be installed, so will use sed as expected.
+SED ?= $(shell which gsed 2>/dev/null || which sed)
+
+MIXIN_ROOT              ?= mixin
+THANOS_MIXIN            ?= mixin/thanos
+JSONNET_VENDOR_DIR      ?= mixin/vendor
+
 WEB_DIR           ?= website
 WEBSITE_BASE_URL  ?= https://thanos.io
 PUBLIC_DIR        ?= $(WEB_DIR)/public
@@ -49,7 +72,7 @@ ME                ?= $(shell whoami)
 PROM_VERSIONS           ?= v2.4.3 v2.5.0 v2.8.1 v2.9.2 v2.13.0
 PROMS ?= $(GOBIN)/prometheus-v2.4.3 $(GOBIN)/prometheus-v2.5.0 $(GOBIN)/prometheus-v2.8.1 $(GOBIN)/prometheus-v2.9.2 $(GOBIN)/prometheus-v2.13.0
 
-ALERTMANAGER_VERSION    ?= v0.15.2
+ALERTMANAGER_VERSION    ?= v0.20.0
 ALERTMANAGER            ?= $(GOBIN)/alertmanager-$(ALERTMANAGER_VERSION)
 
 MINIO_SERVER_VERSION    ?= RELEASE.2018-10-06T00-15-16Z
@@ -100,7 +123,7 @@ endef
 .PHONY: all
 all: format build
 
-# assets repacks all statis assets into go file for easier deploy.
+# assets repacks all static assets into go file for easier deploy.
 .PHONY: assets
 assets: $(GOBINDATA)
 	@echo ">> deleting asset file"
@@ -150,14 +173,20 @@ docker-push:
 # docs regenerates flags in docs for all thanos commands.
 .PHONY: docs
 docs: $(EMBEDMD) build
-	@EMBEDMD_BIN="$(EMBEDMD)" scripts/genflagdocs.sh
+	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" scripts/genflagdocs.sh
+	@find . -type f -name "*.md" | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
 
-# check-docs checks if documentation have discrepancy with flags and if the links are valid.
+# check-docs checks:
+# - discrepancy with flags is valid
+# - links are valid
+# - white noise
 .PHONY: check-docs
 check-docs: $(EMBEDMD) $(LICHE) build
-	@EMBEDMD_BIN="$(EMBEDMD)" scripts/genflagdocs.sh check
-	@$(LICHE) --recursive docs --exclude "cloud.tencent.com" --document-root .
-	@$(LICHE) --exclude "cloud.tencent.com|goreportcard.com" --document-root . *.md
+	@EMBEDMD_BIN="$(EMBEDMD)" SED_BIN="$(SED)" scripts/genflagdocs.sh check
+	@$(LICHE) --recursive docs --exclude "(couchdb.apache.org/bylaws.html|cloud.tencent.com|alibabacloud.com)" --document-root .
+	@$(LICHE) --exclude "goreportcard.com" --document-root . *.md
+	@find . -type f -name "*.md" | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
+	$(call require_clean_work_tree,"check documentation")
 
 # checks Go code comments if they have trailing period (excludes protobuffers and vendor files).
 # Comments with more than 3 spaces at beginning are omitted from the check, example: '//    - foo'.
@@ -166,11 +195,14 @@ check-comments:
 	@printf ">> checking Go comments trailing periods\n\n\n"
 	@./scripts/build-check-comments.sh
 
-# format formats the code (including imports format).
+# format the code:
+# - format code (including imports format)
+# - clean up all white noise
 .PHONY: format
 format: $(GOIMPORTS) check-comments
 	@echo ">> formatting code"
 	@$(GOIMPORTS) -w $(FILES_TO_FMT)
+	@SED_BIN="$(SED)" scripts/cleanup-white-noise.sh $(FILES_TO_FMT)
 
 # proto generates golang files from Thanos proto files.
 .PHONY: proto
@@ -199,26 +231,19 @@ test: check-git install-deps
 	@go install github.com/thanos-io/thanos/cmd/thanos
 	# Be careful on GOCACHE. Those tests are sometimes using built Thanos/Prometheus binaries directly. Don't cache those.
 	@rm -rf ${GOCACHE}
-	@echo ">> running all tests. Do export THANOS_SKIP_GCS_TESTS='true' or/and THANOS_SKIP_S3_AWS_TESTS='true' or/and THANOS_SKIP_AZURE_TESTS='true' and/or THANOS_SKIP_SWIFT_TESTS='true' and/or THANOS_SKIP_TENCENT_COS_TESTS='true' if you want to skip e2e tests against real store buckets"
+	@echo ">> running all tests. Do export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS if you want to skip e2e tests against all real store buckets. Current value: ${THANOS_TEST_OBJSTORE_SKIP}"
 	@go test $(shell go list ./... | grep -v /vendor/);
 
-.PHONY: test-only-gcs
-test-only-gcs: export THANOS_SKIP_S3_AWS_TESTS = true
-test-only-gcs: export THANOS_SKIP_AZURE_TESTS = true
-test-only-gcs: export THANOS_SKIP_SWIFT_TESTS = true
-test-only-gcs: export THANOS_SKIP_TENCENT_COS_TESTS = true
-test-only-gcs:
-	@echo ">> Skipping S3 tests"
-	@echo ">> Skipping AZURE tests"
-	@echo ">> Skipping SWIFT tests"
-	@echo ">> Skipping TENCENT tests"
+.PHONY: test-ci
+test-ci: export THANOS_TEST_OBJSTORE_SKIP=AZURE,SWIFT,COS,ALIYUNOSS
+test-ci:
+	@echo ">> Skipping ${THANOS_TEST_OBJSTORE_SKIP} tests"
 	$(MAKE) test
 
 .PHONY: test-local
-test-local: export THANOS_SKIP_GCS_TESTS = true
+test-local: export THANOS_TEST_OBJSTORE_SKIP=GCS,S3,AZURE,SWIFT,COS,ALIYUNOSS
 test-local:
-	@echo ">> Skipping GCE tests"
-	$(MAKE) test-only-gcs
+	$(MAKE) test
 
 # install-deps installs dependencies for e2e tetss.
 # It installs supported versions of Prometheus and alertmanager to test against in e2e.
@@ -266,15 +291,99 @@ web: web-pre-process $(HUGO)
 #
 # to debug big allocations during linting.
 lint: check-git $(GOLANGCILINT) $(MISSPELL)
+	@echo ">> examining all of the Go files"
+	@go vet -stdmethods=false ./pkg/... ./cmd/... && go vet doc.go
 	@echo ">> linting all of the Go files GOGC=${GOGC}"
-	@$(GOLANGCILINT) run --enable goimports --enable goconst --skip-dirs vendor
+	@$(GOLANGCILINT) run
 	@echo ">> detecting misspells"
 	@find . -type f | grep -v vendor/ | grep -vE '\./\..*' | xargs $(MISSPELL) -error
+	@echo ">> detecting white noise"
+	@find . -type f \( -name "*.md" -o -name "*.go" \) | SED_BIN="$(SED)" xargs scripts/cleanup-white-noise.sh
+	$(call require_clean_work_tree,"detected white noise")
+	@echo ">> ensuring Copyright headers"
+	@go run ./scripts/copyright
+	$(call require_clean_work_tree,"detected files without copyright")
 
 .PHONY: web-serve
 web-serve: web-pre-process $(HUGO)
 	@echo ">> serving documentation website"
 	@cd $(WEB_DIR) && $(HUGO) --config hugo.yaml -v server
+
+# Check https://github.com/coreos/prometheus-operator/blob/master/scripts/jsonnet/Dockerfile for the image.
+JSONNET_CONTAINER_CMD:=docker run --rm \
+		-u="$(shell id -u):$(shell id -g)" \
+		-v "$(shell go env GOCACHE):/.cache/go-build" \
+		-v "$(PWD):/go/src/github.com/thanos-io/thanos:Z" \
+		-w "/go/src/github.com/thanos-io/thanos" \
+		-e USER=deadbeef \
+		-e GO111MODULE=on \
+		quay.io/coreos/jsonnet-ci:release-0.36
+
+.PHONY: examples-in-container
+examples-in-container:
+	@echo ">> Compiling and generating thanos-mixin"
+	$(JSONNET_CONTAINER_CMD) make $(MFLAGS) JSONNET_BUNDLER='/go/bin/jb' jsonnet-vendor
+	$(JSONNET_CONTAINER_CMD) make $(MFLAGS) \
+		EMBEDMD='/go/bin/embedmd' \
+		JSONNET='/go/bin/jsonnet' \
+		JSONNET_BUNDLER='/go/bin/jb' \
+		PROMTOOL='/go/bin/promtool' \
+		GOJSONTOYAML='/go/bin/gojsontoyaml' \
+		GOLANGCILINT='/go/bin/golangci-lint' \
+		examples
+
+.PHONY: examples
+examples: jsonnet-format ${THANOS_MIXIN}/README.md examples/alerts/alerts.md examples/alerts/alerts.yaml examples/alerts/rules.yaml examples/dashboards examples/tmp
+	$(EMBEDMD) -w examples/alerts/alerts.md
+	$(EMBEDMD) -w ${THANOS_MIXIN}/README.md
+
+.PHONY: examples/tmp
+examples/tmp:
+	-rm -rf examples/tmp/
+	-mkdir -p examples/tmp/
+	$(JSONNET) -J ${JSONNET_VENDOR_DIR} -m examples/tmp/ ${THANOS_MIXIN}/separated_alerts.jsonnet | xargs -I{} sh -c 'cat {} | $(GOJSONTOYAML) > {}.yaml; rm -f {}' -- {}
+
+.PHONY: examples/dashboards # to keep examples/dashboards/dashboards.md.
+examples/dashboards: $(JSONNET) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/defaults.libsonnet ${THANOS_MIXIN}/dashboards/*
+	-rm -rf examples/dashboards/*.json
+	$(JSONNET) -J ${JSONNET_VENDOR_DIR} -m examples/dashboards ${THANOS_MIXIN}/dashboards.jsonnet
+
+examples/alerts/alerts.yaml: $(JSONNET) $(GOJSONTOYAML) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/defaults.libsonnet ${THANOS_MIXIN}/alerts/*
+	$(JSONNET) ${THANOS_MIXIN}/alerts.jsonnet | $(GOJSONTOYAML) > $@
+
+examples/alerts/rules.yaml: $(JSONNET) $(GOJSONTOYAML) ${THANOS_MIXIN}/mixin.libsonnet ${THANOS_MIXIN}/defaults.libsonnet ${THANOS_MIXIN}/rules/*
+	$(JSONNET) ${THANOS_MIXIN}/rules.jsonnet | $(GOJSONTOYAML) > $@
+
+.PHONY: jsonnet-vendor
+jsonnet-vendor: $(JSONNET_BUNDLER) $(MIXIN_ROOT)/jsonnetfile.json $(MIXIN_ROOT)/jsonnetfile.lock.json
+	rm -rf ${JSONNET_VENDOR_DIR}
+	cd ${MIXIN_ROOT} && $(JSONNET_BUNDLER) install
+
+JSONNET_FMT := jsonnetfmt -n 2 --max-blank-lines 2 --string-style s --comment-style s
+
+.PHONY: jsonnet-format
+jsonnet-format:
+	@which jsonnetfmt 2>&1 >/dev/null || ( \
+		echo "Cannot find jsonnetfmt command, please install from https://github.com/google/jsonnet/releases.\nIf your C++ does not support GLIBCXX_3.4.20, please use xxx-in-container target like jsonnet-format-in-container." \
+		&& exit 1)
+	find . -name 'vendor' -prune -o -name '*.libsonnet' -print -o -name '*.jsonnet' -print | \
+		xargs -n 1 -- $(JSONNET_FMT) -i
+
+.PHONY: jsonnet-format-in-container
+jsonnet-format-in-container:
+	$(JSONNET_CONTAINER_CMD) make $(MFLAGS) jsonnet-format
+
+.PHONY: example-rules-lint
+example-rules-lint: $(PROMTOOL) examples/alerts/alerts.yaml examples/alerts/rules.yaml
+	$(PROMTOOL) check rules examples/alerts/alerts.yaml examples/alerts/rules.yaml
+	$(PROMTOOL) test rules examples/alerts/tests.yaml
+
+.PHONY: examples-clean
+examples-clean:
+	rm -f examples/alerts/alerts.yaml
+	rm -f examples/alerts/rules.yaml
+	rm -f examples/dashboards/*.json
+	rm -f examples/tmp/*.yaml
 
 # non-phony targets
 $(EMBEDMD):
@@ -319,3 +428,15 @@ $(PROTOC):
 	@echo ">> installing protoc@${PROTOC_VERSION}"
 	@mv -- "$(TMP_GOPATH)/bin/protoc" "$(GOBIN)/protoc-$(PROTOC_VERSION)"
 	@echo ">> produced $(GOBIN)/protoc-$(PROTOC_VERSION)"
+
+$(JSONNET):
+	$(call fetch_go_bin_version,github.com/google/go-jsonnet/cmd/jsonnet,$(JSONNET_VERSION))
+
+$(GOJSONTOYAML):
+	$(call fetch_go_bin_version,github.com/brancz/gojsontoyaml,$(GOJSONTOYAML_VERSION))
+
+$(JSONNET_BUNDLER):
+	$(call fetch_go_bin_version,github.com/jsonnet-bundler/jsonnet-bundler/cmd/jb,$(JSONNET_BUNDLER_VERSION))
+
+$(PROMTOOL):
+	$(call fetch_go_bin_version,github.com/prometheus/prometheus/cmd/promtool,$(PROMTOOL_VERSION))

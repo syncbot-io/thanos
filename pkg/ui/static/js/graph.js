@@ -44,6 +44,9 @@ Prometheus.Graph.prototype.initialize = function() {
   if (self.options.tab === undefined) {
     self.options.tab = 1;
   }
+  if (self.options.max_source_resolution === undefined) {
+	  self.options.max_source_resolution = "0s";
+  }
 
   // Draw graph controls and container from Handlebars template.
 
@@ -93,6 +96,8 @@ Prometheus.Graph.prototype.initialize = function() {
   self.stacked = self.queryForm.find("input[name=stacked]");
   self.insertMetric = self.queryForm.find("select[name=insert_metric]");
   self.refreshInterval = self.queryForm.find("select[name=refresh]");
+  self.maxSourceResolutionInput = self.queryForm.find("select[name=max_source_resolution_input]");
+
 
   self.consoleTab = graphWrapper.find(".console");
   self.graphTab   = graphWrapper.find(".graph_container");
@@ -189,47 +194,65 @@ Prometheus.Graph.prototype.initialize = function() {
     self.updateGraph();
   });
 
+  // Toggle functions.
+  self.toggleOn = function(targetEl, item) {
+    $(targetEl).addClass('glyphicon-check').removeClass('glyphicon-unchecked');
+    localStorage.setItem(item, '1');
+  };
+  self.toggleOff = function(targetEl, item) {
+    $(targetEl).addClass('glyphicon-unchecked').removeClass('glyphicon-check');
+    localStorage.setItem(item, '0');
+  };
+
   // Deduplication.
+  let dedup_icon = self.dedupBtn.find('.glyphicon');
   self.isDedupEnabled = function() {
-      return self.enableDedup.val() === '1';
+    let v = localStorage.getItem('enable-dedup');
+
+    // If not set in localstorage, make it enabled.
+    return v === '1' || v === null;
   };
-  var styleDedupBtn = function() {
-      var icon = self.dedupBtn.find('.glyphicon');
-      if (self.isDedupEnabled()) {
-          icon.addClass("glyphicon-check");
-          icon.removeClass("glyphicon-unchecked");
-      } else {
-          icon.addClass("glyphicon-unchecked");
-          icon.removeClass("glyphicon-check");
-      }
-  };
-  styleDedupBtn();
+
+  if (self.isDedupEnabled()) {
+    self.toggleOn(dedup_icon, 'enable-dedup');
+  } else {
+    self.toggleOff(dedup_icon, 'enable-dedup');
+  }
 
   self.dedupBtn.click(function() {
     self.enableDedup.val(self.isDedupEnabled() ? '0' : '1');
-    styleDedupBtn();
+    if (dedup_icon.hasClass('glyphicon-unchecked')) {
+      self.toggleOn(dedup_icon, 'enable-dedup');
+    } else if (dedup_icon.hasClass('glyphicon-check')) {
+      self.toggleOff(dedup_icon, 'enable-dedup');
+    }
   });
 
   // Partial response.
+  let partial_response_icon = self.partialResponseBtn.find('.glyphicon');
   self.isPartialResponseEnabled = function() {
-    return self.partialResponse.val() === '1';
+    let v = localStorage.getItem('enable-partial-response');
+
+    // If not set in localstorage, make it enabled.
+    return v === '1' || v === null;
   };
-  var stylePartialResponseBtn = function() {
-    var icon = self.partialResponseBtn.find('.glyphicon');
-    if (self.isPartialResponseEnabled()) {
-      icon.addClass("glyphicon-check");
-      icon.removeClass("glyphicon-unchecked");
-    } else {
-      icon.addClass("glyphicon-unchecked");
-      icon.removeClass("glyphicon-check");
-    }
-  };
-  stylePartialResponseBtn();
+
+  if (self.isPartialResponseEnabled()) {
+    self.toggleOn(partial_response_icon, 'enable-partial-response');
+  } else {
+    self.toggleOff(partial_response_icon, 'enable-partial-response');
+  }
 
   self.partialResponseBtn.click(function() {
     self.partialResponse.val(self.isPartialResponseEnabled() ? '0' : '1');
-    stylePartialResponseBtn();
+    if (partial_response_icon.hasClass('glyphicon-unchecked')) {
+      self.toggleOn(partial_response_icon, 'enable-partial-response');
+    } else if (partial_response_icon.hasClass('glyphicon-check')) {
+      self.toggleOff(partial_response_icon, 'enable-partial-response');
+    }
   });
+
+  self.maxSourceResolutionInput.val(self.options.max_source_resolution);
 
   self.queryForm.submit(function() {
     self.consoleTab.addClass("reload");
@@ -377,7 +400,6 @@ Prometheus.Graph.prototype.getOptions = function() {
     "range_input",
     "end_input",
     "step_input",
-    "downsample_input",
     "stacked",
     "moment_input"
   ];
@@ -390,6 +412,9 @@ Prometheus.Graph.prototype.getOptions = function() {
       }
     }
   });
+
+  options.max_source_resolution = self.maxSourceResolutionInput.val();
+
   options.expr = self.expr.val();
   options.tab = self.options.tab;
   return options;
@@ -521,7 +546,7 @@ Prometheus.Graph.prototype.submitQuery = function() {
   var startTime = new Date().getTime();
   var rangeSeconds = self.parseDuration(self.rangeInput.val());
   var resolution = parseInt(self.queryForm.find("input[name=step_input]").val()) || Math.max(Math.floor(rangeSeconds / 250), 1);
-  var maxSourceResolution = self.queryForm.find("select[name=max_source_resolution_input]").val();
+  var maxSourceResolution = self.maxSourceResolutionInput.val()
   var endDate = self.getEndDate() / 1000;
   var moment = self.getMoment() / 1000;
 

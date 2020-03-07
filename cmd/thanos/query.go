@@ -1,21 +1,18 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
-	"io/ioutil"
 	"math"
-	"net"
 	"net/http"
 	"path"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/oklog/run"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -23,23 +20,25 @@ import (
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/discovery/file"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/prometheus/prometheus/tsdb/labels"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
+
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/cache"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	"github.com/thanos-io/thanos/pkg/extgrpc"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/query"
 	v1 "github.com/thanos-io/thanos/pkg/query/api"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
+	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/store"
-	"github.com/thanos-io/thanos/pkg/tracing"
+	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/ui"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
 // registerQuery registers a query command.
@@ -47,7 +46,8 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	comp := component.Query
 	cmd := app.Command(comp.String(), "query node exposing PromQL enabled Query API with data retrieved from multiple store nodes")
 
-	grpcBindAddr, httpBindAddr, srvCert, srvKey, srvClientCA := regCommonServerFlags(cmd)
+	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
+	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
 
 	secure := cmd.Flag("grpc-client-tls-secure", "Use TLS when talking to the gRPC server").Default("false").Bool()
 	cert := cmd.Flag("grpc-client-tls-cert", "TLS Certificates to use to identify this client to the server").Default("").String()
@@ -94,14 +94,14 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	enableAutodownsampling := cmd.Flag("query.auto-downsampling", "Enable automatic adjustment (step / 5) to what source of data should be used in store gateways if no max_source_resolution param is specified.").
 		Default("false").Bool()
 
-	enablePartialResponse := cmd.Flag("query.partial-response", "Enable partial response for queries if no partial_response param is specified.").
+	enablePartialResponse := cmd.Flag("query.partial-response", "Enable partial response for queries if no partial_response param is specified. --no-query.partial-response for disabling.").
 		Default("true").Bool()
 
 	defaultEvaluationInterval := modelDuration(cmd.Flag("query.default-evaluation-interval", "Set default evaluation interval for sub queries.").Default("1m"))
 
 	storeResponseTimeout := modelDuration(cmd.Flag("store.response-timeout", "If a Store doesn't send any data in this specified duration then a Store will be ignored and partial data will be returned if it's enabled. 0 disables timeout.").Default("0ms"))
 
-	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
+	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
@@ -133,15 +133,17 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			reg,
 			tracer,
 			*grpcBindAddr,
-			*srvCert,
-			*srvKey,
-			*srvClientCA,
+			time.Duration(*grpcGracePeriod),
+			*grpcCert,
+			*grpcKey,
+			*grpcClientCA,
 			*secure,
 			*cert,
 			*key,
 			*caCert,
 			*serverName,
 			*httpBindAddr,
+			time.Duration(*httpGracePeriod),
 			*webRoutePrefix,
 			*webExternalPrefix,
 			*webPrefixHeaderName,
@@ -163,87 +165,6 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	}
 }
 
-func storeClientGRPCOpts(logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, secure bool, cert, key, caCert string, serverName string) ([]grpc.DialOption, error) {
-	grpcMets := grpc_prometheus.NewClientMetrics()
-	grpcMets.EnableClientHandlingTimeHistogram(
-		grpc_prometheus.WithHistogramBuckets([]float64{
-			0.001, 0.01, 0.05, 0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4,
-		}),
-	)
-	dialOpts := []grpc.DialOption{
-		// We want to make sure that we can receive huge gRPC messages from storeAPI.
-		// On TCP level we can be fine, but the gRPC overhead for huge messages could be significant.
-		// Current limit is ~2GB.
-		// TODO(bplotka): Split sent chunks on store node per max 4MB chunks if needed.
-		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
-		grpc.WithUnaryInterceptor(
-			grpc_middleware.ChainUnaryClient(
-				grpcMets.UnaryClientInterceptor(),
-				tracing.UnaryClientInterceptor(tracer),
-			),
-		),
-		grpc.WithStreamInterceptor(
-			grpc_middleware.ChainStreamClient(
-				grpcMets.StreamClientInterceptor(),
-				tracing.StreamClientInterceptor(tracer),
-			),
-		),
-	}
-
-	if reg != nil {
-		reg.MustRegister(grpcMets)
-	}
-
-	if !secure {
-		return append(dialOpts, grpc.WithInsecure()), nil
-	}
-
-	level.Info(logger).Log("msg", "Enabling client to server TLS")
-
-	var certPool *x509.CertPool
-
-	if caCert != "" {
-		caPEM, err := ioutil.ReadFile(caCert)
-		if err != nil {
-			return nil, errors.Wrap(err, "reading client CA")
-		}
-
-		certPool = x509.NewCertPool()
-		if !certPool.AppendCertsFromPEM(caPEM) {
-			return nil, errors.Wrap(err, "building client CA")
-		}
-		level.Info(logger).Log("msg", "TLS Client using provided certificate pool")
-	} else {
-		var err error
-		certPool, err = x509.SystemCertPool()
-		if err != nil {
-			return nil, errors.Wrap(err, "reading system certificate pool")
-		}
-		level.Info(logger).Log("msg", "TLS Client using system certificate pool")
-	}
-
-	tlsCfg := &tls.Config{
-		RootCAs: certPool,
-	}
-
-	if serverName != "" {
-		tlsCfg.ServerName = serverName
-	}
-
-	if cert != "" {
-		cert, err := tls.LoadX509KeyPair(cert, key)
-		if err != nil {
-			return nil, errors.Wrap(err, "client credentials")
-		}
-		tlsCfg.Certificates = []tls.Certificate{cert}
-		level.Info(logger).Log("msg", "TLS Client authentication enabled")
-	}
-
-	creds := credentials.NewTLS(tlsCfg)
-
-	return append(dialOpts, grpc.WithTransportCredentials(creds)), nil
-}
-
 // runQuery starts a server that exposes PromQL Query API. It is responsible for querying configured
 // store nodes, merging and duplicating the data to satisfy user query.
 func runQuery(
@@ -252,15 +173,17 @@ func runQuery(
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
 	grpcBindAddr string,
-	srvCert string,
-	srvKey string,
-	srvClientCA string,
+	grpcGracePeriod time.Duration,
+	grpcCert string,
+	grpcKey string,
+	grpcClientCA string,
 	secure bool,
 	cert string,
 	key string,
 	caCert string,
 	serverName string,
 	httpBindAddr string,
+	httpGracePeriod time.Duration,
 	webRoutePrefix string,
 	webExternalPrefix string,
 	webPrefixHeaderName string,
@@ -281,12 +204,12 @@ func runQuery(
 ) error {
 	// TODO(bplotka in PR #513 review): Move arguments into struct.
 	duplicatedStores := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "thanos_query_duplicated_store_address",
+		Name: "thanos_query_duplicated_store_addresses_total",
 		Help: "The number of times a duplicated store addresses is detected from the different configs in query",
 	})
 	reg.MustRegister(duplicatedStores)
 
-	dialOpts, err := storeClientGRPCOpts(logger, reg, tracer, secure, cert, key, caCert, serverName)
+	dialOpts, err := extgrpc.StoreClientGRPCOpts(logger, reg, tracer, secure, cert, key, caCert, serverName)
 	if err != nil {
 		return errors.Wrap(err, "building gRPC client")
 	}
@@ -315,7 +238,7 @@ func runQuery(
 			dialOpts,
 			unhealthyStoreTimeout,
 		)
-		proxy            = store.NewProxyStore(logger, stores.Get, component.Query, selectorLset, storeResponseTimeout)
+		proxy            = store.NewProxyStore(logger, reg, stores.Get, component.Query, selectorLset, storeResponseTimeout)
 		queryableCreator = query.NewQueryableCreator(logger, proxy)
 		engine           = promql.NewEngine(
 			promql.EngineOpts{
@@ -388,9 +311,16 @@ func runQuery(
 			cancel()
 		})
 	}
-	// Start query API + UI HTTP server.
 
-	statusProber := prober.NewProber(comp, logger, reg)
+	grpcProbe := prober.NewGRPC()
+	httpProbe := prober.NewHTTP()
+	statusProber := prober.Combine(
+		httpProbe,
+		grpcProbe,
+		prober.NewInstrumentation(comp, logger, reg),
+	)
+
+	// Start query API + UI HTTP server.
 	{
 		router := route.New()
 
@@ -414,31 +344,42 @@ func runQuery(
 
 		api.Register(router.WithPrefix(path.Join(webRoutePrefix, "/api/v1")), tracer, logger, ins)
 
-		// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
-		if err := scheduleHTTPServer(g, logger, reg, statusProber, httpBindAddr, router, comp); err != nil {
-			return errors.Wrap(err, "schedule HTTP server with probes")
-		}
+		srv := httpserver.New(logger, reg, comp, httpProbe,
+			httpserver.WithListen(httpBindAddr),
+			httpserver.WithGracePeriod(httpGracePeriod),
+		)
+		srv.Handle("/", router)
+
+		g.Add(func() error {
+			statusProber.Healthy()
+
+			return srv.ListenAndServe()
+		}, func(err error) {
+			statusProber.NotReady(err)
+			defer statusProber.NotHealthy(err)
+
+			srv.Shutdown(err)
+		})
 	}
 	// Start query (proxy) gRPC StoreAPI.
 	{
-		l, err := net.Listen("tcp", grpcBindAddr)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
 		if err != nil {
-			return errors.Wrap(err, "listen gRPC on address")
+			return errors.Wrap(err, "setup gRPC server")
 		}
-		logger := log.With(logger, "component", component.Query.String())
 
-		opts, err := defaultGRPCServerOpts(logger, srvCert, srvKey, srvClientCA)
-		if err != nil {
-			return errors.Wrap(err, "build gRPC server")
-		}
-		s := newStoreGRPCServer(logger, reg, tracer, proxy, opts)
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, proxy,
+			grpcserver.WithListen(grpcBindAddr),
+			grpcserver.WithGracePeriod(grpcGracePeriod),
+			grpcserver.WithTLSConfig(tlsCfg),
+		)
 
 		g.Add(func() error {
-			level.Info(logger).Log("msg", "Listening for StoreAPI gRPC", "address", grpcBindAddr)
-			statusProber.SetReady()
-			return errors.Wrap(s.Serve(l), "serve gRPC")
+			statusProber.Ready()
+			return s.ListenAndServe()
 		}, func(error) {
-			s.Stop()
+			statusProber.NotReady(err)
+			s.Shutdown(err)
 		})
 	}
 

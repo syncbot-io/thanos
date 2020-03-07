@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package main
 
 import (
@@ -5,8 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"time"
-
-	"github.com/thanos-io/thanos/pkg/extflag"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -22,10 +23,13 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/extflag"
+	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
 
@@ -33,15 +37,15 @@ func registerDownsample(m map[string]setupFunc, app *kingpin.Application) {
 	comp := component.Downsample
 	cmd := app.Command(comp.String(), "continuously downsamples blocks in an object store bucket")
 
-	httpAddr := regHTTPAddrFlag(cmd)
+	httpAddr, httpGracePeriod := regHTTPFlags(cmd)
 
 	dataDir := cmd.Flag("data-dir", "Data directory in which to cache blocks and process downsamplings.").
 		Default("./data").String()
 
 	objStoreConfig := regCommonObjStoreFlags(cmd, "", true)
 
-	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
-		return runDownsample(g, logger, reg, *httpAddr, *dataDir, objStoreConfig, comp)
+	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+		return runDownsample(g, logger, reg, *httpAddr, time.Duration(*httpGracePeriod), *dataDir, objStoreConfig, comp)
 	}
 }
 
@@ -73,6 +77,7 @@ func runDownsample(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	httpBindAddr string,
+	httpGracePeriod time.Duration,
 	dataDir string,
 	objStoreConfig *extflag.PathOrContent,
 	comp component.Component,
@@ -87,6 +92,11 @@ func runDownsample(
 		return err
 	}
 
+	metaFetcher, err := block.NewMetaFetcher(logger, 32, bkt, "", extprom.WrapRegistererWithPrefix("thanos_", reg))
+	if err != nil {
+		return errors.Wrap(err, "create meta fetcher")
+	}
+
 	// Ensure we close up everything properly.
 	defer func() {
 		if err != nil {
@@ -94,25 +104,30 @@ func runDownsample(
 		}
 	}()
 
+	httpProbe := prober.NewHTTP()
+	statusProber := prober.Combine(
+		httpProbe,
+		prober.NewInstrumentation(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg)),
+	)
+
 	metrics := newDownsampleMetrics(reg)
-	statusProber := prober.NewProber(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
 	// Start cycle of syncing blocks from the bucket and garbage collecting the bucket.
 	{
 		ctx, cancel := context.WithCancel(context.Background())
 
 		g.Add(func() error {
 			defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
-			statusProber.SetReady()
+			statusProber.Ready()
 
 			level.Info(logger).Log("msg", "start first pass of downsampling")
 
-			if err := downsampleBucket(ctx, logger, metrics, bkt, dataDir); err != nil {
+			if err := downsampleBucket(ctx, logger, metrics, bkt, metaFetcher, dataDir); err != nil {
 				return errors.Wrap(err, "downsampling failed")
 			}
 
 			level.Info(logger).Log("msg", "start second pass of downsampling")
 
-			if err := downsampleBucket(ctx, logger, metrics, bkt, dataDir); err != nil {
+			if err := downsampleBucket(ctx, logger, metrics, bkt, metaFetcher, dataDir); err != nil {
 				return errors.Wrap(err, "downsampling failed")
 			}
 
@@ -122,10 +137,21 @@ func runDownsample(
 		})
 	}
 
-	// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
-	if err := scheduleHTTPServer(g, logger, reg, statusProber, httpBindAddr, nil, comp); err != nil {
-		return errors.Wrap(err, "schedule HTTP server with probe")
-	}
+	srv := httpserver.New(logger, reg, comp, httpProbe,
+		httpserver.WithListen(httpBindAddr),
+		httpserver.WithGracePeriod(httpGracePeriod),
+	)
+
+	g.Add(func() error {
+		statusProber.Healthy()
+
+		return srv.ListenAndServe()
+	}, func(err error) {
+		statusProber.NotReady(err)
+		defer statusProber.NotHealthy(err)
+
+		srv.Shutdown(err)
+	})
 
 	level.Info(logger).Log("msg", "starting downsample node")
 	return nil
@@ -136,6 +162,7 @@ func downsampleBucket(
 	logger log.Logger,
 	metrics *DownsampleMetrics,
 	bkt objstore.Bucket,
+	fetcher block.MetadataFetcher,
 	dir string,
 ) error {
 	if err := os.RemoveAll(dir); err != nil {
@@ -151,25 +178,9 @@ func downsampleBucket(
 		}
 	}()
 
-	var metas []*metadata.Meta
-
-	err := bkt.Iter(ctx, "", func(name string) error {
-		id, ok := block.IsBlockDir(name)
-		if !ok {
-			return nil
-		}
-
-		m, err := block.DownloadMeta(ctx, logger, bkt, id)
-		if err != nil {
-			return errors.Wrap(err, "download metadata")
-		}
-
-		metas = append(metas, &m)
-
-		return nil
-	})
+	metas, _, err := fetcher.Fetch(ctx)
 	if err != nil {
-		return errors.Wrap(err, "retrieve bucket block metas")
+		return errors.Wrap(err, "downsampling meta fetch")
 	}
 
 	// mapping from a hash over all source IDs to blocks. We don't need to downsample a block
@@ -214,10 +225,10 @@ func downsampleBucket(
 				continue
 			}
 			if err := processDownsampling(ctx, logger, bkt, m, dir, downsample.ResLevel1); err != nil {
-				metrics.downsampleFailures.WithLabelValues(compact.GroupKey(*m)).Inc()
+				metrics.downsampleFailures.WithLabelValues(compact.GroupKey(m.Thanos)).Inc()
 				return errors.Wrap(err, "downsampling to 5 min")
 			}
-			metrics.downsamples.WithLabelValues(compact.GroupKey(*m)).Inc()
+			metrics.downsamples.WithLabelValues(compact.GroupKey(m.Thanos)).Inc()
 
 		case downsample.ResLevel1:
 			missing := false
@@ -237,10 +248,10 @@ func downsampleBucket(
 				continue
 			}
 			if err := processDownsampling(ctx, logger, bkt, m, dir, downsample.ResLevel2); err != nil {
-				metrics.downsampleFailures.WithLabelValues(compact.GroupKey(*m))
+				metrics.downsampleFailures.WithLabelValues(compact.GroupKey(m.Thanos))
 				return errors.Wrap(err, "downsampling to 60 min")
 			}
-			metrics.downsamples.WithLabelValues(compact.GroupKey(*m))
+			metrics.downsamples.WithLabelValues(compact.GroupKey(m.Thanos))
 		}
 	}
 	return nil

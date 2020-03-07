@@ -1,23 +1,18 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package main
 
 import (
 	"context"
-	"fmt"
 	"math/rand"
-	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/signal"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
-	"syscall"
 	"time"
-
-	"github.com/thanos-io/thanos/pkg/extflag"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
@@ -27,30 +22,32 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/discovery/file"
-	"github.com/prometheus/prometheus/discovery/targetgroup"
-	promlabels "github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/storage/tsdb"
-	"github.com/prometheus/prometheus/tsdb/labels"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/thanos-io/thanos/pkg/alert"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/discovery/cache"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	http_util "github.com/thanos-io/thanos/pkg/http"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/promclient"
+	"github.com/thanos-io/thanos/pkg/query"
 	thanosrule "github.com/thanos-io/thanos/pkg/rule"
 	v1 "github.com/thanos-io/thanos/pkg/rule/api"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
+	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/shipper"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"github.com/thanos-io/thanos/pkg/ui"
 	"gopkg.in/alecthomas/kingpin.v2"
@@ -61,7 +58,8 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 	comp := component.Rule
 	cmd := app.Command(comp.String(), "ruler evaluating Prometheus rules against given Query nodes, exposing Store API and storing old blocks in bucket")
 
-	grpcBindAddr, httpBindAddr, cert, key, clientCA := regCommonServerFlags(cmd)
+	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
+	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
 
 	labelStrs := cmd.Flag("label", "Labels to be applied to all generated metrics (repeated). Similar to external labels for Prometheus, used to identify ruler and its blocks as unique source.").
 		PlaceHolder("<name>=\"<value>\"").Strings()
@@ -79,10 +77,14 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 	tsdbRetention := modelDuration(cmd.Flag("tsdb.retention", "Block retention time on local disk.").
 		Default("48h"))
 
-	alertmgrs := cmd.Flag("alertmanagers.url", "Alertmanager replica URLs to push firing alerts. Ruler claims success if push to at least one alertmanager from discovered succeeds. The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Alertmanager IPs through respective DNS lookups. The port defaults to 9093 or the SRV record's value. The URL path is used as a prefix for the regular Alertmanager API path.").
-		Strings()
+	walCompression := cmd.Flag("tsdb.wal-compression", "Compress the tsdb WAL.").Default("true").Bool()
 
-	alertmgrsTimeout := cmd.Flag("alertmanagers.send-timeout", "Timeout for sending alerts to alertmanager").Default("10s").Duration()
+	alertmgrs := cmd.Flag("alertmanagers.url", "Alertmanager replica URLs to push firing alerts. Ruler claims success if push to at least one alertmanager from discovered succeeds. The scheme should not be empty e.g `http` might be used. The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect Alertmanager IPs through respective DNS lookups. The port defaults to 9093 or the SRV record's value. The URL path is used as a prefix for the regular Alertmanager API path.").
+		Strings()
+	alertmgrsTimeout := cmd.Flag("alertmanagers.send-timeout", "Timeout for sending alerts to Alertmanager").Default("10s").Duration()
+	alertmgrsConfig := extflag.RegisterPathOrContent(cmd, "alertmanagers.config", "YAML file that contains alerting configuration. See format details: https://thanos.io/components/rule.md/#configuration. If defined, it takes precedence over the '--alertmanagers.url' and '--alertmanagers.send-timeout' flags.", false)
+	alertmgrsDNSSDInterval := modelDuration(cmd.Flag("alertmanagers.sd-dns-interval", "Interval between DNS resolutions of Alertmanager hosts.").
+		Default("30s"))
 
 	alertQueryURL := cmd.Flag("alert.query-url", "The external Thanos Query URL that would be set in all alerts 'Source' field").String()
 
@@ -97,7 +99,9 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 	queries := cmd.Flag("query", "Addresses of statically configured query API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect query API servers through respective DNS lookups.").
 		PlaceHolder("<query>").Strings()
 
-	fileSDFiles := cmd.Flag("query.sd-files", "Path to file that contain addresses of query peers. The path can be a glob pattern (repeatable).").
+	queryConfig := extflag.RegisterPathOrContent(cmd, "query.config", "YAML file that contains query API servers configuration. See format details: https://thanos.io/components/rule.md/#configuration. If defined, it takes precedence over the '--query' and '--query.sd-files' flags.", false)
+
+	fileSDFiles := cmd.Flag("query.sd-files", "Path to file that contains addresses of query API servers. The path can be a glob pattern (repeatable).").
 		PlaceHolder("<path>").Strings()
 
 	fileSDInterval := modelDuration(cmd.Flag("query.sd-interval", "Refresh interval to re-read file SD files. (used as a fallback)").
@@ -109,7 +113,7 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 	dnsSDResolver := cmd.Flag("query.sd-dns-resolver", "Resolver to use. Possible options: [golang, miekgdns]").
 		Default("golang").Hidden().String()
 
-	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
+	m[comp.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, reload <-chan struct{}, _ bool) error {
 		lset, err := parseFlagLabels(*labelStrs)
 		if err != nil {
 			return errors.Wrap(err, "parse labels")
@@ -124,8 +128,10 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 			MaxBlockDuration:  *tsdbBlockDuration,
 			RetentionDuration: *tsdbRetention,
 			NoLockfile:        true,
+			WALCompression:    *walCompression,
 		}
 
+		// Parse and check query configuration.
 		lookupQueries := map[string]struct{}{}
 		for _, q := range *queries {
 			if _, ok := lookupQueries[q]; ok {
@@ -135,31 +141,43 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 			lookupQueries[q] = struct{}{}
 		}
 
-		var fileSD *file.Discovery
-		if len(*fileSDFiles) > 0 {
-			conf := &file.SDConfig{
-				Files:           *fileSDFiles,
-				RefreshInterval: *fileSDInterval,
-			}
-			fileSD = file.NewDiscovery(conf, logger)
+		queryConfigYAML, err := queryConfig.Content()
+		if err != nil {
+			return err
+		}
+		if len(*fileSDFiles) == 0 && len(*queries) == 0 && len(queryConfigYAML) == 0 {
+			return errors.New("no --query parameter was given")
+		}
+		if (len(*fileSDFiles) != 0 || len(*queries) != 0) && len(queryConfigYAML) != 0 {
+			return errors.New("--query/--query.sd-files and --query.config* parameters cannot be defined at the same time")
 		}
 
-		if fileSD == nil && len(*queries) == 0 {
-			return errors.Errorf("No --query parameter was given.")
+		// Parse and check alerting configuration.
+		alertmgrsConfigYAML, err := alertmgrsConfig.Content()
+		if err != nil {
+			return err
+		}
+		if len(alertmgrsConfigYAML) != 0 && len(*alertmgrs) != 0 {
+			return errors.New("--alertmanagers.url and --alertmanagers.config* parameters cannot be defined at the same time")
 		}
 
 		return runRule(g,
 			logger,
 			reg,
 			tracer,
+			reload,
 			lset,
 			*alertmgrs,
 			*alertmgrsTimeout,
+			alertmgrsConfigYAML,
+			time.Duration(*alertmgrsDNSSDInterval),
 			*grpcBindAddr,
-			*cert,
-			*key,
-			*clientCA,
+			time.Duration(*grpcGracePeriod),
+			*grpcCert,
+			*grpcKey,
+			*grpcClientCA,
 			*httpBindAddr,
+			time.Duration(*httpGracePeriod),
 			*webRoutePrefix,
 			*webExternalPrefix,
 			*webPrefixHeaderName,
@@ -172,7 +190,9 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application) {
 			alertQueryURL,
 			*alertExcludeLabels,
 			*queries,
-			fileSD,
+			*fileSDFiles,
+			time.Duration(*fileSDInterval),
+			queryConfigYAML,
 			time.Duration(*dnsSDInterval),
 			*dnsSDResolver,
 			comp,
@@ -187,14 +207,19 @@ func runRule(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
+	reloadSignal <-chan struct{},
 	lset labels.Labels,
 	alertmgrURLs []string,
 	alertmgrsTimeout time.Duration,
+	alertmgrsConfigYAML []byte,
+	alertmgrsDNSSDInterval time.Duration,
 	grpcBindAddr string,
-	cert string,
-	key string,
-	clientCA string,
+	grpcGracePeriod time.Duration,
+	grpcCert string,
+	grpcKey string,
+	grpcClientCA string,
 	httpBindAddr string,
+	httpGracePeriod time.Duration,
 	webRoutePrefix string,
 	webExternalPrefix string,
 	webPrefixHeaderName string,
@@ -207,7 +232,9 @@ func runRule(
 	alertQueryURL *url.URL,
 	alertExcludeLabels []string,
 	queryAddrs []string,
-	fileSD *file.Discovery,
+	querySDFiles []string,
+	querySDInterval time.Duration,
+	queryConfigYAML []byte,
 	dnsSDInterval time.Duration,
 	dnsSDResolver string,
 	comp component.Component,
@@ -221,12 +248,8 @@ func runRule(
 		Help: "Timestamp of the last successful configuration reload.",
 	})
 	duplicatedQuery := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "thanos_rule_duplicated_query_address",
+		Name: "thanos_rule_duplicated_query_addresses_total",
 		Help: "The number of times a duplicated query addresses is detected from the different configs in rule",
-	})
-	alertMngrAddrResolutionErrors := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "thanos_rule_alertmanager_address_resolution_errors",
-		Help: "The number of times resolving an address of an alertmanager has failed inside Thanos Rule",
 	})
 	rulesLoaded := prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
@@ -247,14 +270,61 @@ func runRule(
 	reg.MustRegister(configSuccess)
 	reg.MustRegister(configSuccessTime)
 	reg.MustRegister(duplicatedQuery)
-	reg.MustRegister(alertMngrAddrResolutionErrors)
 	reg.MustRegister(rulesLoaded)
 	reg.MustRegister(ruleEvalWarnings)
 
-	for _, addr := range queryAddrs {
-		if addr == "" {
-			return errors.New("static querier address cannot be empty")
+	var queryCfg []query.Config
+	if len(queryConfigYAML) > 0 {
+		var err error
+		queryCfg, err = query.LoadConfigs(queryConfigYAML)
+		if err != nil {
+			return err
 		}
+	} else {
+		for _, addr := range queryAddrs {
+			if addr == "" {
+				return errors.New("static querier address cannot be empty")
+			}
+		}
+
+		// Build the query configuration from the legacy query flags.
+		var fileSDConfigs []http_util.FileSDConfig
+		if len(querySDFiles) > 0 {
+			fileSDConfigs = append(fileSDConfigs, http_util.FileSDConfig{
+				Files:           querySDFiles,
+				RefreshInterval: model.Duration(querySDInterval),
+			})
+		}
+		queryCfg = append(queryCfg,
+			query.Config{
+				EndpointsConfig: http_util.EndpointsConfig{
+					Scheme:          "http",
+					StaticAddresses: queryAddrs,
+					FileSDConfigs:   fileSDConfigs,
+				},
+			},
+		)
+	}
+
+	queryProvider := dns.NewProvider(
+		logger,
+		extprom.WrapRegistererWithPrefix("thanos_ruler_query_apis_", reg),
+		dns.ResolverType(dnsSDResolver),
+	)
+	var queryClients []*http_util.Client
+	for _, cfg := range queryCfg {
+		c, err := http_util.NewHTTPClient(cfg.HTTPClientConfig, "query")
+		if err != nil {
+			return err
+		}
+		c.Transport = tracing.HTTPTripperware(logger, c.Transport)
+		queryClient, err := http_util.NewClient(logger, cfg.EndpointsConfig, c, queryProvider.Clone())
+		if err != nil {
+			return err
+		}
+		queryClients = append(queryClients, queryClient)
+		// Discover and resolve query addresses.
+		addDiscoveryGroups(g, queryClient, dnsSDInterval)
 	}
 
 	db, err := tsdb.Open(dataDir, log.With(logger, "component", "tsdb"), reg, tsdbOpts)
@@ -271,20 +341,55 @@ func runRule(
 		})
 	}
 
-	// FileSD query addresses.
-	fileSDCache := cache.New()
+	// Build the Alertmanager clients.
+	var alertingCfg alert.AlertingConfig
+	if len(alertmgrsConfigYAML) > 0 {
+		alertingCfg, err = alert.LoadAlertingConfig(alertmgrsConfigYAML)
+		if err != nil {
+			return err
+		}
+	} else {
+		// Build the Alertmanager configuration from the legacy flags.
+		for _, addr := range alertmgrURLs {
+			cfg, err := alert.BuildAlertmanagerConfig(addr, alertmgrsTimeout)
+			if err != nil {
+				return err
+			}
+			alertingCfg.Alertmanagers = append(alertingCfg.Alertmanagers, cfg)
+		}
+	}
 
-	dnsProvider := dns.NewProvider(
+	if len(alertingCfg.Alertmanagers) == 0 {
+		level.Warn(logger).Log("msg", "no alertmanager configured")
+	}
+
+	amProvider := dns.NewProvider(
 		logger,
-		extprom.WrapRegistererWithPrefix("thanos_ruler_query_apis_", reg),
+		extprom.WrapRegistererWithPrefix("thanos_ruler_alertmanagers_", reg),
 		dns.ResolverType(dnsSDResolver),
 	)
+	var alertmgrs []*alert.Alertmanager
+	for _, cfg := range alertingCfg.Alertmanagers {
+		c, err := http_util.NewHTTPClient(cfg.HTTPClientConfig, "alertmanager")
+		if err != nil {
+			return err
+		}
+		c.Transport = tracing.HTTPTripperware(logger, c.Transport)
+		// Each Alertmanager client has a different list of targets thus each needs its own DNS provider.
+		amClient, err := http_util.NewClient(logger, cfg.EndpointsConfig, c, amProvider.Clone())
+		if err != nil {
+			return err
+		}
+		// Discover and resolve Alertmanager addresses.
+		addDiscoveryGroups(g, amClient, alertmgrsDNSSDInterval)
+
+		alertmgrs = append(alertmgrs, alert.NewAlertmanager(logger, amClient, time.Duration(cfg.Timeout), cfg.APIVersion))
+	}
 
 	// Run rule evaluation and alert notifications.
 	var (
-		alertmgrs = newAlertmanagerSet(logger, alertmgrURLs, dns.ResolverType(dnsSDResolver))
-		alertQ    = alert.NewQueue(logger, reg, 10000, 100, labelsTSDBToProm(lset), alertExcludeLabels)
-		ruleMgrs  = thanosrule.Managers{}
+		alertQ  = alert.NewQueue(logger, reg, 10000, 100, labelsTSDBToProm(lset), alertExcludeLabels)
+		ruleMgr = thanosrule.NewManager(dataDir)
 	)
 	{
 		notify := func(ctx context.Context, expr string, alerts ...*rules.Alert) {
@@ -320,6 +425,7 @@ func runRule(
 			ResendDelay: resendDelay,
 		}
 
+		// TODO(bwplotka): Hide this behind thanos rules.Manager.
 		for _, strategy := range storepb.PartialResponseStrategy_value {
 			s := storepb.PartialResponseStrategy(strategy)
 
@@ -329,24 +435,26 @@ func runRule(
 			opts := opts
 			opts.Registerer = extprom.WrapRegistererWith(prometheus.Labels{"strategy": strings.ToLower(s.String())}, reg)
 			opts.Context = ctx
-			opts.QueryFunc = queryFunc(logger, dnsProvider, duplicatedQuery, ruleEvalWarnings, s)
+			opts.QueryFunc = queryFunc(logger, queryClients, duplicatedQuery, ruleEvalWarnings, s)
 
-			ruleMgrs[s] = rules.NewManager(&opts)
+			mgr := rules.NewManager(&opts)
+			ruleMgr.SetRuleManager(s, mgr)
 			g.Add(func() error {
-				ruleMgrs[s].Run()
+				mgr.Run()
 				<-ctx.Done()
 
 				return nil
 			}, func(error) {
 				cancel()
-				ruleMgrs[s].Stop()
+				mgr.Stop()
 			})
 		}
 	}
+	// Run the alert sender.
 	{
-		// TODO(bwplotka): https://github.com/thanos-io/thanos/issues/660.
-		sdr := alert.NewSender(logger, reg, alertmgrs.get, nil, alertmgrsTimeout)
+		sdr := alert.NewSender(logger, reg, alertmgrs)
 		ctx, cancel := context.WithCancel(context.Background())
+		ctx = tracing.ContextWithTracer(ctx, tracer)
 
 		g.Add(func() error {
 			for {
@@ -362,54 +470,6 @@ func runRule(
 			cancel()
 		})
 	}
-	{
-		ctx, cancel := context.WithCancel(context.Background())
-
-		g.Add(func() error {
-			return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
-				if err := alertmgrs.update(ctx); err != nil {
-					level.Error(logger).Log("msg", "refreshing alertmanagers failed", "err", err)
-					alertMngrAddrResolutionErrors.Inc()
-				}
-				return nil
-			})
-		}, func(error) {
-			cancel()
-		})
-	}
-	// Run File Service Discovery and update the query addresses when the files are modified.
-	if fileSD != nil {
-		var fileSDUpdates chan []*targetgroup.Group
-		ctxRun, cancelRun := context.WithCancel(context.Background())
-
-		fileSDUpdates = make(chan []*targetgroup.Group)
-
-		g.Add(func() error {
-			fileSD.Run(ctxRun, fileSDUpdates)
-			return nil
-		}, func(error) {
-			cancelRun()
-		})
-
-		ctxUpdate, cancelUpdate := context.WithCancel(context.Background())
-		g.Add(func() error {
-			for {
-				select {
-				case update := <-fileSDUpdates:
-					// Discoverers sometimes send nil updates so need to check for it to avoid panics.
-					if update == nil {
-						continue
-					}
-					fileSDCache.Update(update)
-				case <-ctxUpdate.Done():
-					return nil
-				}
-			}
-		}, func(error) {
-			cancelUpdate()
-			close(fileSDUpdates)
-		})
-	}
 
 	// Handle reload and termination interrupts.
 	reload := make(chan struct{}, 1)
@@ -423,6 +483,7 @@ func runRule(
 				case <-cancel:
 					return errors.New("canceled")
 				case <-reload:
+				case <-reloadSignal:
 				}
 
 				level.Debug(logger).Log("msg", "configured rule files", "files", strings.Join(ruleFiles, ","))
@@ -440,20 +501,18 @@ func runRule(
 
 				level.Info(logger).Log("msg", "reload rule files", "numFiles", len(files))
 
-				if err := ruleMgrs.Update(dataDir, evalInterval, files); err != nil {
+				if err := ruleMgr.Update(evalInterval, files); err != nil {
 					configSuccess.Set(0)
 					level.Error(logger).Log("msg", "reloading rules failed", "err", err)
 					continue
 				}
 
 				configSuccess.Set(1)
-				configSuccessTime.Set(float64(time.Now().UnixNano()) / 1e9)
+				configSuccessTime.SetToCurrentTime()
 
 				rulesLoaded.Reset()
-				for s, mgr := range ruleMgrs {
-					for _, group := range mgr.RuleGroups() {
-						rulesLoaded.WithLabelValues(s.String(), group.File(), group.Name()).Set(float64(len(group.Rules())))
-					}
+				for _, group := range ruleMgr.RuleGroups() {
+					rulesLoaded.WithLabelValues(group.PartialResponseStrategy.String(), group.File(), group.Name()).Set(float64(len(group.Rules())))
 				}
 
 			}
@@ -461,61 +520,36 @@ func runRule(
 			close(cancel)
 		})
 	}
-	{
-		cancel := make(chan struct{})
 
-		g.Add(func() error {
-			c := make(chan os.Signal, 1)
-			for {
-				signal.Notify(c, syscall.SIGHUP)
-				select {
-				case <-c:
-					select {
-					case reload <- struct{}{}:
-					default:
-					}
-				case <-cancel:
-					return errors.New("canceled")
-				}
-			}
-		}, func(error) {
-			close(cancel)
-		})
-	}
-	// Periodically update the addresses from static flags and file SD by resolving them using DNS SD if necessary.
-	{
-		ctx, cancel := context.WithCancel(context.Background())
-		g.Add(func() error {
-			return runutil.Repeat(dnsSDInterval, ctx.Done(), func() error {
-				dnsProvider.Resolve(ctx, append(fileSDCache.Addresses(), queryAddrs...))
-				return nil
-			})
-		}, func(error) {
-			cancel()
-		})
-	}
-	statusProber := prober.NewProber(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg))
+	grpcProbe := prober.NewGRPC()
+	httpProbe := prober.NewHTTP()
+	statusProber := prober.Combine(
+		httpProbe,
+		grpcProbe,
+		prober.NewInstrumentation(comp, logger, prometheus.WrapRegistererWithPrefix("thanos_", reg)),
+	)
+
 	// Start gRPC server.
 	{
-		l, err := net.Listen("tcp", grpcBindAddr)
-		if err != nil {
-			return errors.Wrap(err, "listen API address")
-		}
-		logger := log.With(logger, "component", component.Rule.String())
-
 		store := store.NewTSDBStore(logger, reg, db, component.Rule, lset)
 
-		opts, err := defaultGRPCServerOpts(logger, cert, key, clientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
 		if err != nil {
-			return errors.Wrap(err, "setup gRPC options")
+			return errors.Wrap(err, "setup gRPC server")
 		}
-		s := newStoreGRPCServer(logger, reg, tracer, store, opts)
+
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, store,
+			grpcserver.WithListen(grpcBindAddr),
+			grpcserver.WithGracePeriod(grpcGracePeriod),
+			grpcserver.WithTLSConfig(tlsCfg),
+		)
 
 		g.Add(func() error {
-			statusProber.SetReady()
-			return errors.Wrap(s.Serve(l), "serve gRPC")
-		}, func(error) {
-			s.Stop()
+			statusProber.Ready()
+			return s.ListenAndServe()
+		}, func(err error) {
+			statusProber.NotReady(err)
+			s.Shutdown(err)
 		})
 	}
 	// Start UI & metrics HTTP server.
@@ -541,15 +575,27 @@ func runRule(
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg)
 
-		ui.NewRuleUI(logger, reg, ruleMgrs, alertQueryURL.String(), flagsMap).Register(router.WithPrefix(webRoutePrefix), ins)
+		ui.NewRuleUI(logger, reg, ruleMgr, alertQueryURL.String(), flagsMap).Register(router.WithPrefix(webRoutePrefix), ins)
 
-		api := v1.NewAPI(logger, reg, ruleMgrs)
+		api := v1.NewAPI(logger, reg, ruleMgr)
 		api.Register(router.WithPrefix(path.Join(webRoutePrefix, "/api/v1")), tracer, logger, ins)
 
-		// Initiate HTTP listener providing metrics endpoint and readiness/liveness probes.
-		if err := scheduleHTTPServer(g, logger, reg, statusProber, httpBindAddr, router, comp); err != nil {
-			return errors.Wrap(err, "schedule HTTP server with probes")
-		}
+		srv := httpserver.New(logger, reg, comp, httpProbe,
+			httpserver.WithListen(httpBindAddr),
+			httpserver.WithGracePeriod(httpGracePeriod),
+		)
+		srv.Handle("/", router)
+
+		g.Add(func() error {
+			statusProber.Healthy()
+
+			return srv.ListenAndServe()
+		}, func(err error) {
+			statusProber.NotReady(err)
+			defer statusProber.NotHealthy(err)
+
+			srv.Shutdown(err)
+		})
 	}
 
 	confContentYaml, err := objStoreConfig.Content()
@@ -557,13 +603,7 @@ func runRule(
 		return err
 	}
 
-	uploads := true
-	if len(confContentYaml) == 0 {
-		level.Info(logger).Log("msg", "No supported bucket was configured, uploads will be disabled")
-		uploads = false
-	}
-
-	if uploads {
+	if len(confContentYaml) > 0 {
 		// The background shipper continuously scans the data directory and uploads
 		// new blocks to Google Cloud Storage or an S3-compatible storage service.
 		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Rule.String())
@@ -578,7 +618,7 @@ func runRule(
 			}
 		}()
 
-		s := shipper.New(logger, nil, dataDir, bkt, func() labels.Labels { return lset }, metadata.RulerSource)
+		s := shipper.New(logger, reg, dataDir, bkt, func() labels.Labels { return lset }, metadata.RulerSource)
 
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -594,93 +634,11 @@ func runRule(
 		}, func(error) {
 			cancel()
 		})
+	} else {
+		level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
 	}
 
 	level.Info(logger).Log("msg", "starting rule node")
-	return nil
-}
-
-type alertmanagerSet struct {
-	resolver dns.Resolver
-	addrs    []string
-	mtx      sync.Mutex
-	current  []*url.URL
-}
-
-func newAlertmanagerSet(logger log.Logger, addrs []string, dnsSDResolver dns.ResolverType) *alertmanagerSet {
-	return &alertmanagerSet{
-		resolver: dns.NewResolver(dnsSDResolver.ToResolver(logger)),
-		addrs:    addrs,
-	}
-}
-
-func (s *alertmanagerSet) get() []*url.URL {
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	return s.current
-}
-
-const defaultAlertmanagerPort = 9093
-
-func parseAlertmanagerAddress(addr string) (qType dns.QType, parsedUrl *url.URL, err error) {
-	qType = ""
-	parsedUrl, err = url.Parse(addr)
-	if err != nil {
-		return qType, nil, err
-	}
-	// The Scheme might contain DNS resolver type separated by + so we split it a part.
-	if schemeParts := strings.Split(parsedUrl.Scheme, "+"); len(schemeParts) > 1 {
-		parsedUrl.Scheme = schemeParts[len(schemeParts)-1]
-		qType = dns.QType(strings.Join(schemeParts[:len(schemeParts)-1], "+"))
-	}
-	return qType, parsedUrl, err
-}
-
-func (s *alertmanagerSet) update(ctx context.Context) error {
-	var result []*url.URL
-	for _, addr := range s.addrs {
-		var (
-			qtype          dns.QType
-			resolvedDomain []string
-		)
-
-		qtype, u, err := parseAlertmanagerAddress(addr)
-		if err != nil {
-			return errors.Wrapf(err, "parse URL %q", addr)
-		}
-
-		// Get only the host and resolve it if needed.
-		host := u.Host
-		if qtype != "" {
-			if qtype == dns.A {
-				_, _, err = net.SplitHostPort(host)
-				if err != nil {
-					// The host could be missing a port. Append the defaultAlertmanagerPort.
-					host = host + ":" + strconv.Itoa(defaultAlertmanagerPort)
-				}
-			}
-			resolvedDomain, err = s.resolver.Resolve(ctx, host, qtype)
-			if err != nil {
-				return errors.Wrap(err, "alertmanager resolve")
-			}
-		} else {
-			resolvedDomain = []string{host}
-		}
-
-		for _, resolved := range resolvedDomain {
-			result = append(result, &url.URL{
-				Scheme: u.Scheme,
-				Host:   resolved,
-				Path:   u.Path,
-				User:   u.User,
-			})
-		}
-	}
-
-	s.mtx.Lock()
-	s.current = result
-	s.mtx.Unlock()
-
 	return nil
 }
 
@@ -703,9 +661,9 @@ func parseFlagLabels(s []string) (labels.Labels, error) {
 	return lset, nil
 }
 
-func labelsTSDBToProm(lset labels.Labels) (res promlabels.Labels) {
+func labelsTSDBToProm(lset labels.Labels) (res labels.Labels) {
 	for _, l := range lset {
-		res = append(res, promlabels.Label{
+		res = append(res, labels.Label{
 			Name:  l.Name,
 			Value: l.Value,
 		})
@@ -713,19 +671,17 @@ func labelsTSDBToProm(lset labels.Labels) (res promlabels.Labels) {
 	return res
 }
 
-func removeDuplicateQueryAddrs(logger log.Logger, duplicatedQueriers prometheus.Counter, addrs []string) []string {
+func removeDuplicateQueryEndpoints(logger log.Logger, duplicatedQueriers prometheus.Counter, urls []*url.URL) []*url.URL {
 	set := make(map[string]struct{})
-	for _, addr := range addrs {
-		if _, ok := set[addr]; ok {
-			level.Warn(logger).Log("msg", "Duplicate query address is provided - %v", addr)
+	deduplicated := make([]*url.URL, 0, len(urls))
+	for _, u := range urls {
+		if _, ok := set[u.String()]; ok {
+			level.Warn(logger).Log("msg", "duplicate query address is provided - %v", u.String())
 			duplicatedQueriers.Inc()
+			continue
 		}
-		set[addr] = struct{}{}
-	}
-
-	deduplicated := make([]string, 0, len(set))
-	for key := range set {
-		deduplicated = append(deduplicated, key)
+		deduplicated = append(deduplicated, u)
+		set[u.String()] = struct{}{}
 	}
 	return deduplicated
 }
@@ -734,7 +690,7 @@ func removeDuplicateQueryAddrs(logger log.Logger, duplicatedQueriers prometheus.
 // back or the context get canceled.
 func queryFunc(
 	logger log.Logger,
-	dnsProvider *dns.Provider,
+	queriers []*http_util.Client,
 	duplicatedQuery prometheus.Counter,
 	ruleEvalWarnings *prometheus.CounterVec,
 	partialResponseStrategy storepb.PartialResponseStrategy,
@@ -751,29 +707,27 @@ func queryFunc(
 		panic(errors.Errorf("unknown partial response strategy %v", partialResponseStrategy).Error())
 	}
 
+	promClients := make([]*promclient.Client, 0, len(queriers))
+	for _, q := range queriers {
+		promClients = append(promClients, promclient.NewClient(logger, q))
+	}
+
 	return func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
-		// Add DNS resolved addresses from static flags and file SD.
-		// TODO(bwplotka): Consider generating addresses in *url.URL.
-		addrs := dnsProvider.Addresses()
+		for _, i := range rand.Perm(len(queriers)) {
+			promClient := promClients[i]
+			endpoints := removeDuplicateQueryEndpoints(logger, duplicatedQuery, queriers[i].Endpoints())
+			for _, i := range rand.Perm(len(endpoints)) {
+				span, ctx := tracing.StartSpan(ctx, spanID)
+				v, warns, err := promClient.PromqlQueryInstant(ctx, endpoints[i], q, t, promclient.QueryOptions{
+					Deduplicate:             true,
+					PartialResponseStrategy: partialResponseStrategy,
+				})
+				span.Finish()
 
-		removeDuplicateQueryAddrs(logger, duplicatedQuery, addrs)
-
-		for _, i := range rand.Perm(len(addrs)) {
-			u, err := url.Parse(fmt.Sprintf("http://%s", addrs[i]))
-			if err != nil {
-				return nil, errors.Wrapf(err, "url parse %s", addrs[i])
-			}
-
-			span, ctx := tracing.StartSpan(ctx, spanID)
-			v, warns, err := promclient.PromqlQueryInstant(ctx, logger, u, q, t, promclient.QueryOptions{
-				Deduplicate:             true,
-				PartialResponseStrategy: partialResponseStrategy,
-			})
-			span.Finish()
-
-			if err != nil {
-				level.Error(logger).Log("err", err, "query", q)
-			} else {
+				if err != nil {
+					level.Error(logger).Log("err", err, "query", q)
+					continue
+				}
 				if len(warns) > 0 {
 					ruleEvalWarnings.WithLabelValues(strings.ToLower(partialResponseStrategy.String())).Inc()
 					// TODO(bwplotka): Propagate those to UI, probably requires changing rule manager code ):
@@ -782,6 +736,25 @@ func queryFunc(
 				return v, nil
 			}
 		}
-		return nil, errors.Errorf("no query peer reachable")
+		return nil, errors.Errorf("no query API server reachable")
 	}
+}
+
+func addDiscoveryGroups(g *run.Group, c *http_util.Client, interval time.Duration) {
+	ctx, cancel := context.WithCancel(context.Background())
+	g.Add(func() error {
+		c.Discover(ctx)
+		return nil
+	}, func(error) {
+		cancel()
+	})
+
+	g.Add(func() error {
+		return runutil.Repeat(interval, ctx.Done(), func() error {
+			c.Resolve(ctx)
+			return nil
+		})
+	}, func(error) {
+		cancel()
+	})
 }

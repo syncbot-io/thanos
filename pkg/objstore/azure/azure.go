@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package azure
 
 import (
@@ -228,6 +231,20 @@ func (b *Bucket) GetRange(ctx context.Context, name string, off, length int64) (
 	return b.getBlobReader(ctx, name, off, length)
 }
 
+// ObjectSize returns the size of the specified object.
+func (b *Bucket) ObjectSize(ctx context.Context, name string) (uint64, error) {
+	blobURL, err := getBlobURL(ctx, *b.config, name)
+	if err != nil {
+		return 0, errors.Wrapf(err, "cannot get Azure blob URL, blob: %s", name)
+	}
+	var props *blob.BlobGetPropertiesResponse
+	props, err = blobURL.GetProperties(ctx, blob.BlobAccessConditions{})
+	if err != nil {
+		return 0, err
+	}
+	return uint64(props.ContentLength()), nil
+}
+
 // Exists checks if the given object exists.
 func (b *Bucket) Exists(ctx context.Context, name string) (bool, error) {
 	level.Debug(b.logger).Log("msg", "check if blob exists", "blob", name)
@@ -291,7 +308,7 @@ func NewTestBucket(t testing.TB, component string) (objstore.Bucket, func(), err
 	conf := &Config{
 		StorageAccountName: os.Getenv("AZURE_STORAGE_ACCOUNT"),
 		StorageAccountKey:  os.Getenv("AZURE_STORAGE_ACCESS_KEY"),
-		ContainerName:      "thanos-e2e-test",
+		ContainerName:      objstore.CreateTemporaryTestBucketName(t),
 	}
 
 	bc, err := yaml.Marshal(conf)

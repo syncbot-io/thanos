@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package ui
 
 import (
@@ -13,6 +16,7 @@ import (
 // Bucket is a web UI representing state of buckets as a timeline.
 type Bucket struct {
 	*BaseUI
+	flagsMap map[string]string
 	// Unique Prometheus label that identifies each shard, used as the title. If
 	// not present, all labels are displayed externally as a legend.
 	Label       string
@@ -21,11 +25,12 @@ type Bucket struct {
 	Err         error
 }
 
-func NewBucketUI(logger log.Logger, label string) *Bucket {
+func NewBucketUI(logger log.Logger, label string, flagsMap map[string]string) *Bucket {
 	return &Bucket{
-		BaseUI: NewBaseUI(logger, "bucket_menu.html", queryTmplFuncs()),
-		Blocks: "[]",
-		Label:  label,
+		BaseUI:   NewBaseUI(logger, "bucket_menu.html", queryTmplFuncs()),
+		Blocks:   "[]",
+		Label:    label,
+		flagsMap: flagsMap,
 	}
 }
 
@@ -41,7 +46,8 @@ func (b *Bucket) Register(r *route.Router, ins extpromhttp.InstrumentationMiddle
 
 // Handle / of bucket UIs.
 func (b *Bucket) root(w http.ResponseWriter, r *http.Request) {
-	b.executeTemplate(w, "bucket.html", "", b)
+	prefix := GetWebPrefix(b.logger, b.flagsMap, r)
+	b.executeTemplate(w, "bucket.html", prefix, b)
 }
 
 func (b *Bucket) Set(data string, err error) {

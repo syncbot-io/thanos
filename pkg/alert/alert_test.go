@@ -1,18 +1,20 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package alert
 
 import (
-	"bytes"
 	"context"
-	"io/ioutil"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 
-	"github.com/pkg/errors"
 	promtestutil "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
 )
@@ -50,98 +52,92 @@ func assertSameHosts(t *testing.T, expected []*url.URL, found []*url.URL) {
 	}
 }
 
-func TestSender_Send_OK(t *testing.T) {
-	var (
-		expectedHosts = []*url.URL{{Host: "am1:9090"}, {Host: "am2:9090"}}
-		spottedHosts  []*url.URL
-		spottedMu     sync.Mutex
-	)
+type fakeClient struct {
+	urls []*url.URL
+	dof  func(u *url.URL) (*http.Response, error)
+	mtx  sync.Mutex
+	seen []*url.URL
+}
 
-	okDo := func(req *http.Request) (response *http.Response, e error) {
-		spottedMu.Lock()
-		defer spottedMu.Unlock()
+func (f *fakeClient) Endpoints() []*url.URL {
+	return f.urls
+}
 
-		spottedHosts = append(spottedHosts, req.URL)
-
-		return &http.Response{
-			Body:       ioutil.NopCloser(bytes.NewBuffer(nil)),
-			StatusCode: http.StatusOK,
-		}, nil
+func (f *fakeClient) Do(req *http.Request) (*http.Response, error) {
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+	u := req.URL
+	f.seen = append(f.seen, u)
+	if f.dof == nil {
+		rec := httptest.NewRecorder()
+		rec.WriteHeader(http.StatusOK)
+		return rec.Result(), nil
 	}
-	s := NewSender(nil, nil, func() []*url.URL { return expectedHosts }, okDo, 10*time.Second)
+	return f.dof(u)
+}
+
+func TestSenderSendsOk(t *testing.T) {
+	poster := &fakeClient{
+		urls: []*url.URL{{Host: "am1:9090"}, {Host: "am2:9090"}},
+	}
+	s := NewSender(nil, nil, []*Alertmanager{NewAlertmanager(nil, poster, time.Minute, APIv1)})
 
 	s.Send(context.Background(), []*Alert{{}, {}})
 
-	assertSameHosts(t, expectedHosts, spottedHosts)
+	assertSameHosts(t, poster.urls, poster.seen)
 
-	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.sent.WithLabelValues(expectedHosts[0].Host))))
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.errs.WithLabelValues(expectedHosts[0].Host))))
+	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.sent.WithLabelValues(poster.urls[0].Host))))
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.errs.WithLabelValues(poster.urls[0].Host))))
 
-	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.sent.WithLabelValues(expectedHosts[1].Host))))
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.errs.WithLabelValues(expectedHosts[1].Host))))
+	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.sent.WithLabelValues(poster.urls[1].Host))))
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.errs.WithLabelValues(poster.urls[1].Host))))
 	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.dropped)))
 }
 
-func TestSender_Send_OneFails(t *testing.T) {
-	var (
-		expectedHosts = []*url.URL{{Host: "am1:9090"}, {Host: "am2:9090"}}
-		spottedHosts  []*url.URL
-		spottedMu     sync.Mutex
-	)
+func TestSenderSendsOneFails(t *testing.T) {
+	poster := &fakeClient{
+		urls: []*url.URL{{Host: "am1:9090"}, {Host: "am2:9090"}},
+		dof: func(u *url.URL) (*http.Response, error) {
+			rec := httptest.NewRecorder()
+			if u.Host == "am1:9090" {
+				rec.WriteHeader(http.StatusBadRequest)
+			} else {
+				rec.WriteHeader(http.StatusOK)
+			}
+			return rec.Result(), nil
+		},
+	}
+	s := NewSender(nil, nil, []*Alertmanager{NewAlertmanager(nil, poster, time.Minute, APIv1)})
 
-	do := func(req *http.Request) (response *http.Response, e error) {
-		spottedMu.Lock()
-		defer spottedMu.Unlock()
+	s.Send(context.Background(), []*Alert{{}, {}})
 
-		spottedHosts = append(spottedHosts, req.URL)
+	assertSameHosts(t, poster.urls, poster.seen)
 
-		if req.Host == expectedHosts[0].Host {
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.sent.WithLabelValues(poster.urls[0].Host))))
+	testutil.Equals(t, 1, int(promtestutil.ToFloat64(s.errs.WithLabelValues(poster.urls[0].Host))))
+
+	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.sent.WithLabelValues(poster.urls[1].Host))))
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.errs.WithLabelValues(poster.urls[1].Host))))
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.dropped)))
+}
+
+func TestSenderSendsAllFail(t *testing.T) {
+	poster := &fakeClient{
+		urls: []*url.URL{{Host: "am1:9090"}, {Host: "am2:9090"}},
+		dof: func(u *url.URL) (*http.Response, error) {
 			return nil, errors.New("no such host")
-		}
-		return &http.Response{
-			Body:       ioutil.NopCloser(bytes.NewBuffer(nil)),
-			StatusCode: http.StatusOK,
-		}, nil
+		},
 	}
-	s := NewSender(nil, nil, func() []*url.URL { return expectedHosts }, do, 10*time.Second)
+	s := NewSender(nil, nil, []*Alertmanager{NewAlertmanager(nil, poster, time.Minute, APIv1)})
 
 	s.Send(context.Background(), []*Alert{{}, {}})
 
-	assertSameHosts(t, expectedHosts, spottedHosts)
+	assertSameHosts(t, poster.urls, poster.seen)
 
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.sent.WithLabelValues(expectedHosts[0].Host))))
-	testutil.Equals(t, 1, int(promtestutil.ToFloat64(s.errs.WithLabelValues(expectedHosts[0].Host))))
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.sent.WithLabelValues(poster.urls[0].Host))))
+	testutil.Equals(t, 1, int(promtestutil.ToFloat64(s.errs.WithLabelValues(poster.urls[0].Host))))
 
-	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.sent.WithLabelValues(expectedHosts[1].Host))))
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.errs.WithLabelValues(expectedHosts[1].Host))))
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.dropped)))
-}
-
-func TestSender_Send_AllFails(t *testing.T) {
-	var (
-		expectedHosts = []*url.URL{{Host: "am1:9090"}, {Host: "am2:9090"}}
-		spottedHosts  []*url.URL
-		spottedMu     sync.Mutex
-	)
-
-	do := func(req *http.Request) (response *http.Response, e error) {
-		spottedMu.Lock()
-		defer spottedMu.Unlock()
-
-		spottedHosts = append(spottedHosts, req.URL)
-
-		return nil, errors.New("no such host")
-	}
-	s := NewSender(nil, nil, func() []*url.URL { return expectedHosts }, do, 10*time.Second)
-
-	s.Send(context.Background(), []*Alert{{}, {}})
-
-	assertSameHosts(t, expectedHosts, spottedHosts)
-
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.sent.WithLabelValues(expectedHosts[0].Host))))
-	testutil.Equals(t, 1, int(promtestutil.ToFloat64(s.errs.WithLabelValues(expectedHosts[0].Host))))
-
-	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.sent.WithLabelValues(expectedHosts[1].Host))))
-	testutil.Equals(t, 1, int(promtestutil.ToFloat64(s.errs.WithLabelValues(expectedHosts[1].Host))))
+	testutil.Equals(t, 0, int(promtestutil.ToFloat64(s.sent.WithLabelValues(poster.urls[1].Host))))
+	testutil.Equals(t, 1, int(promtestutil.ToFloat64(s.errs.WithLabelValues(poster.urls[1].Host))))
 	testutil.Equals(t, 2, int(promtestutil.ToFloat64(s.dropped)))
 }

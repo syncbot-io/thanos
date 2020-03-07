@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 package model_test
 
 import (
@@ -32,5 +35,5 @@ func TestTimeOrDurationValue(t *testing.T) {
 	testutil.Assert(t, minTime.PrometheusTimestamp() > prevTime, "minTime prometheus timestamp is less than time now.")
 	testutil.Assert(t, minTime.PrometheusTimestamp() < afterTime, "minTime prometheus timestamp is more than time now + 15s")
 
-	testutil.Assert(t, 253402300799000 == maxTime.PrometheusTimestamp(), "maxTime is not equal to 253402300799000")
+	testutil.Assert(t, maxTime.PrometheusTimestamp() == 253402300799000, "maxTime is not equal to 253402300799000")
 }

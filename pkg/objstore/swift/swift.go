@@ -1,3 +1,6 @@
+// Copyright (c) The Thanos Authors.
+// Licensed under the Apache License 2.0.
+
 // Package swift implements common object storage abstractions against OpenStack swift APIs.
 package swift
 
@@ -5,11 +8,9 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math/rand"
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/gophercloud/gophercloud"
@@ -19,7 +20,7 @@ import (
 	"github.com/gophercloud/gophercloud/pagination"
 	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/objstore"
-	yaml "gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v2"
 )
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
@@ -125,6 +126,16 @@ func (c *Container) GetRange(ctx context.Context, name string, off, length int64
 	}
 	response := objects.Download(c.client, c.name, name, options)
 	return response.Body, response.Err
+}
+
+// ObjectSize returns the size of the specified object.
+func (c *Container) ObjectSize(ctx context.Context, name string) (uint64, error) {
+	response := objects.Get(c.client, c.name, name, nil)
+	headers, err := response.Extract()
+	if err != nil {
+		return 0, err
+	}
+	return uint64(headers.ContentLength), nil
 }
 
 // Exists checks if the given object exists.
@@ -291,12 +302,7 @@ func NewTestContainer(t testing.TB) (objstore.Bucket, func(), error) {
 		return c, func() {}, nil
 	}
 
-	src := rand.NewSource(time.Now().UnixNano())
-
-	tmpContainerName := fmt.Sprintf("test_%s_%x", strings.ToLower(t.Name()), src.Int63())
-	if len(tmpContainerName) >= 63 {
-		tmpContainerName = tmpContainerName[:63]
-	}
+	tmpContainerName := objstore.CreateTemporaryTestBucketName(t)
 
 	if err := c.createContainer(tmpContainerName); err != nil {
 		return nil, nil, err
