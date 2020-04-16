@@ -21,12 +21,15 @@ const (
 	PartialUploadThresholdAge = 2 * 24 * time.Hour
 )
 
-func BestEffortCleanAbortedPartialUploads(ctx context.Context, logger log.Logger, fetcher block.MetadataFetcher, bkt objstore.Bucket, deleteAttempts prometheus.Counter) {
+func BestEffortCleanAbortedPartialUploads(
+	ctx context.Context,
+	logger log.Logger,
+	partial map[ulid.ULID]error,
+	bkt objstore.Bucket,
+	deleteAttempts prometheus.Counter,
+	blocksMarkedForDeletion prometheus.Counter,
+) {
 	level.Info(logger).Log("msg", "started cleaning of aborted partial uploads")
-	_, partial, err := fetcher.Fetch(ctx)
-	if err != nil {
-		level.Warn(logger).Log("msg", "failed to fetch metadata for cleaning of aborted partial uploads; skipping", "err", err)
-	}
 
 	// Delete partial blocks that are older than partialUploadThresholdAge.
 	// TODO(bwplotka): This is can cause data loss if blocks are:
@@ -41,7 +44,8 @@ func BestEffortCleanAbortedPartialUploads(ctx context.Context, logger log.Logger
 		}
 
 		deleteAttempts.Inc()
-		if err := block.Delete(ctx, logger, bkt, id); err != nil {
+		level.Info(logger).Log("msg", "found partially uploaded block; marking for deletion", "block", id)
+		if err := block.MarkForDeletion(ctx, logger, bkt, id, blocksMarkedForDeletion); err != nil {
 			level.Warn(logger).Log("msg", "failed to delete aborted partial upload; skipping", "block", id, "thresholdAge", PartialUploadThresholdAge, "err", err)
 			return
 		}

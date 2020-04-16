@@ -22,10 +22,11 @@ import (
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/prompb"
 	"github.com/prometheus/prometheus/storage"
 	terrors "github.com/prometheus/prometheus/tsdb/errors"
+	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -59,7 +60,6 @@ type Options struct {
 	ReplicationFactor uint64
 	Tracer            opentracing.Tracer
 	TLSConfig         *tls.Config
-	TLSClientConfig   *tls.Config
 	DialOpts          []grpc.DialOption
 }
 
@@ -90,7 +90,7 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 		router:  route.New(),
 		options: o,
 		peers:   newPeerGroup(o.DialOpts...),
-		forwardRequestsTotal: prometheus.NewCounterVec(
+		forwardRequestsTotal: promauto.With(o.Registry).NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "thanos_receive_forward_requests_total",
 				Help: "The number of forward requests.",
@@ -101,7 +101,6 @@ func NewHandler(logger log.Logger, o *Options) *Handler {
 	ins := extpromhttp.NewNopInstrumentationMiddleware()
 	if o.Registry != nil {
 		ins = extpromhttp.NewInstrumentationMiddleware(o.Registry)
-		o.Registry.MustRegister(h.forwardRequestsTotal)
 	}
 
 	readyf := h.testReady
@@ -192,6 +191,13 @@ func (h *Handler) Run() error {
 		TLSConfig: h.options.TLSConfig,
 	}
 
+	if h.options.TLSConfig != nil {
+		level.Info(h.logger).Log("msg", "Serving HTTPS", "address", h.options.ListenAddress)
+		// Cert & Key are already being passed in via TLSConfig.
+		return httpSrv.ServeTLS(h.listener, "", "")
+	}
+
+	level.Info(h.logger).Log("msg", "Serving plain HTTP", "address", h.options.ListenAddress)
 	return httpSrv.Serve(h.listener)
 }
 
@@ -395,24 +401,22 @@ func (h *Handler) parallelizeRequests(ctx context.Context, tenant string, replic
 				ec <- err
 				return
 			}
-
 			// Create a span to track the request made to another receive node.
-			span, ctx := tracing.StartSpan(ctx, "thanos_receive_forward")
-			defer span.Finish()
-
-			// Actually make the request against the endpoint
-			// we determined should handle these time series.
-			_, err = cl.RemoteWrite(ctx, &storepb.WriteRequest{
-				Timeseries: wreqs[endpoint].Timeseries,
-				Tenant:     tenant,
-				Replica:    int64(replicas[endpoint].n + 1), // increment replica since on-the-wire format is 1-indexed and 0 indicates unreplicated.
+			tracing.DoInSpan(ctx, "thanos_receive_forward", func(ctx context.Context) {
+				// Actually make the request against the endpoint
+				// we determined should handle these time series.
+				_, err = cl.RemoteWrite(ctx, &storepb.WriteRequest{
+					Timeseries: wreqs[endpoint].Timeseries,
+					Tenant:     tenant,
+					Replica:    int64(replicas[endpoint].n + 1), // increment replica since on-the-wire format is 1-indexed and 0 indicates unreplicated.
+				})
+				if err != nil {
+					level.Error(h.logger).Log("msg", "forwarding request", "err", err, "endpoint", endpoint)
+					ec <- err
+					return
+				}
+				ec <- nil
 			})
-			if err != nil {
-				level.Error(h.logger).Log("msg", "forwarding request", "err", err, "endpoint", endpoint)
-				ec <- err
-				return
-			}
-			ec <- nil
 		}(endpoint)
 	}
 

@@ -5,7 +5,6 @@ package ui
 
 import (
 	"bytes"
-	"fmt"
 	"html/template"
 	"io"
 	"net/http"
@@ -16,6 +15,7 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
+	"github.com/pkg/errors"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/common/version"
 )
@@ -58,15 +58,15 @@ func (bu *BaseUI) serveStaticAsset(w http.ResponseWriter, req *http.Request) {
 func (bu *BaseUI) getTemplate(name string) (string, error) {
 	baseTmpl, err := Asset("pkg/ui/templates/_base.html")
 	if err != nil {
-		return "", fmt.Errorf("error reading base template: %s", err)
+		return "", errors.Errorf("error reading base template: %s", err)
 	}
 	menuTmpl, err := Asset(filepath.Join("pkg/ui/templates", bu.menuTmpl))
 	if err != nil {
-		return "", fmt.Errorf("error reading menu template %s: %s", bu.menuTmpl, err)
+		return "", errors.Errorf("error reading menu template %s: %s", bu.menuTmpl, err)
 	}
 	pageTmpl, err := Asset(filepath.Join("pkg/ui/templates", name))
 	if err != nil {
-		return "", fmt.Errorf("error reading page template %s: %s", name, err)
+		return "", errors.Errorf("error reading page template %s: %s", name, err)
 	}
 	return string(baseTmpl) + string(menuTmpl) + string(pageTmpl), nil
 }
@@ -92,13 +92,13 @@ func (bu *BaseUI) executeTemplate(w http.ResponseWriter, name string, prefix str
 
 // GetWebPrefix sanitizes an external URL path prefix value.
 // A value provided by web.external-prefix flag is preferred over the one supplied through an HTTP header.
-func GetWebPrefix(logger log.Logger, flagsMap map[string]string, r *http.Request) string {
+func GetWebPrefix(logger log.Logger, externalPrefix, prefixHeader string, r *http.Request) string {
 	// Ignore web.prefix-header value if web.external-prefix is defined.
-	if len(flagsMap["web.external-prefix"]) > 0 {
-		return flagsMap["web.external-prefix"]
+	if len(externalPrefix) > 0 {
+		return externalPrefix
 	}
 
-	prefix := r.Header.Get(flagsMap["web.prefix-header"])
+	prefix := r.Header.Get(prefixHeader)
 
 	// Even if rfc2616 suggests that Location header "value consists of a single absolute URI", browsers
 	// support relative location too. So for extra security, scheme and host parts are stripped from a dynamic prefix.

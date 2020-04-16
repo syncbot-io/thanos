@@ -32,7 +32,8 @@ Release shepherd responsibilities:
 
 | Release   | Time of first RC         | Shepherd (GitHub handle) |
 |-----------|--------------------------|--------------------------|
-| v0.12.0   | (planned) 2020.04.01     | TBD                      |
+| v0.13.0   | (planned) 2020.05.13     | `TBD`                    |
+| v0.12.0   | (planned) 2020.04.01     | `@squat`                 |
 | v0.11.0   | 2020.02.19               | `@metalmatze`            |
 | v0.10.0   | 2020.01.08               | `@GiedriusS`             |
 | v0.9.0    | 2019.11.26               | `@bwplotka`              |
@@ -54,6 +55,12 @@ Process of releasing a *minor* Thanos version:
 Release is happening on separate `release-<major>.<minor>` branch.
 
 1. Prepare PR to branch `release-<major>.<minor>` that will start minor release branch and prepare changes to cut release.
+
+    Push the created branch to origin (Thanos repository) to be able to make your PR with the CHANGELOG.md changes against this branch later.
+
+    ```bash
+    $ git push origin release-<major>.<minor>
+    ```
 
   For release candidate just reuse same branch and rebase it on every candidate until the actual release happens.
 
@@ -82,7 +89,7 @@ Release is happening on separate `release-<major>.<minor>` branch.
 1. After review, merge the PR and immediately after this tag a version:
 
     ```bash
-    $ tag=x.y.z
+    $ tag=$(cat VERSION)
     $ git tag -s "v${tag}" -m "v${tag}"
     $ git push origin "v${tag}"
     ```
