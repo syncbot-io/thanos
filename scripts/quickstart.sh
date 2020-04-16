@@ -166,7 +166,6 @@ if [ -n "${REMOTE_WRITE_ENABLED}" ]; then
   ${THANOS_EXECUTABLE} receive \
     --debug.name receive \
     --log.level debug \
-    --log.level debug \
     --tsdb.path "./data/remote-write-receive-data" \
     --grpc-address 0.0.0.0:10907 \
     --grpc-grace-period 1s \
@@ -199,6 +198,15 @@ fi
 
 sleep 0.5
 
+QUERIER_JAEGER_CONFIG=$(cat <<-EOF
+type: JAEGER
+config:
+  service_name: thanos-query
+  sampler_type: ratelimiting
+  sampler_param: 2
+EOF
+)
+
 # Start two query nodes.
 for i in $(seq 0 1); do
   ${THANOS_EXECUTABLE} query \
@@ -209,6 +217,7 @@ for i in $(seq 0 1); do
     --http-address 0.0.0.0:109${i}4 \
     --http-grace-period 1s \
     --query.replica-label prometheus \
+    --tracing.config="${QUERIER_JAEGER_CONFIG}" \
     ${STORES} &
 done
 

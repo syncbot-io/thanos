@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"sort"
 	"testing"
@@ -69,7 +68,7 @@ func TestProxyStore_Info(t *testing.T) {
 	testutil.Equals(t, []storepb.LabelSet(nil), resp.LabelSets)
 	testutil.Equals(t, storepb.StoreType_QUERY, resp.StoreType)
 	testutil.Equals(t, int64(0), resp.MinTime)
-	testutil.Equals(t, int64(math.MaxInt64), resp.MaxTime)
+	testutil.Equals(t, int64(0), resp.MaxTime)
 }
 
 func TestProxyStore_Series(t *testing.T) {
@@ -1310,6 +1309,8 @@ type storeSeriesServer struct {
 
 	SeriesSet []storepb.Series
 	Warnings  []string
+
+	Size int64
 }
 
 func newStoreSeriesServer(ctx context.Context) *storeSeriesServer {
@@ -1317,6 +1318,8 @@ func newStoreSeriesServer(ctx context.Context) *storeSeriesServer {
 }
 
 func (s *storeSeriesServer) Send(r *storepb.SeriesResponse) error {
+	s.Size += int64(r.Size())
+
 	if r.GetWarning() != "" {
 		s.Warnings = append(s.Warnings, r.GetWarning())
 		return nil
