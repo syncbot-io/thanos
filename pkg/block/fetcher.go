@@ -550,6 +550,7 @@ var _ MetadataFilter = &DeduplicateFilter{}
 // Not go-routine safe.
 type DeduplicateFilter struct {
 	duplicateIDs []ulid.ULID
+	mu           sync.Mutex
 }
 
 // NewDeduplicateFilter creates DeduplicateFilter.
@@ -560,6 +561,8 @@ func NewDeduplicateFilter() *DeduplicateFilter {
 // Filter filters out duplicate blocks that can be formed
 // from two or more overlapping blocks that fully submatches the source blocks of the older blocks.
 func (f *DeduplicateFilter) Filter(_ context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec, _ bool) error {
+	f.duplicateIDs = f.duplicateIDs[:0]
+
 	var wg sync.WaitGroup
 
 	metasByResolution := make(map[int64][]*metadata.Meta)
@@ -603,11 +606,13 @@ func (f *DeduplicateFilter) filterForResolution(root *Node, metaSlice []*metadat
 
 	duplicateULIDs := getNonRootIDs(root)
 	for _, id := range duplicateULIDs {
+		f.mu.Lock()
 		if metas[id] != nil {
 			f.duplicateIDs = append(f.duplicateIDs, id)
 		}
 		synced.WithLabelValues(duplicateMeta).Inc()
 		delete(metas, id)
+		f.mu.Unlock()
 	}
 }
 

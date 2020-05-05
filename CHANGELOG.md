@@ -9,9 +9,21 @@ NOTE: As semantic versioning states all 0.y.z releases can contain breaking chan
 
 We use *breaking* word for marking changes that are not backward compatible (relates only to v0.y.z releases.)
 
-## [v0.10.0](https://github.com/thanos-io/thanos/releases/tag/v0.10.0) - 2020.01.13
+## [v0.12.2](https://github.com/thanos-io/thanos/releases/tag/v0.12.2) - 2020.04.30
 
-## [v0.11.0](https://github.com/thanos-io/thanos/releases/tag/v0.11.0-rc.1) - 2020.03.02
+### Fixed
+
+- [#2459](https://github.com/thanos-io/thanos/issues/2459) Compact: Fixed issue with old blocks being marked and deleted in a (slow) loop.
+- [#2533](https://github.com/thanos-io/thanos/pull/2515) Rule: do not wrap reload endpoint with `/`. Makes `/-/reload` accessible again when no prefix has been specified.
+
+## [v0.12.1](https://github.com/thanos-io/thanos/releases/tag/v0.12.1) - 2020.04.20
+
+### Fixed
+
+- [#2411](https://github.com/thanos-io/thanos/pull/2411) Query: fix a bug where queries might not time out sometimes due to issues with one or more StoreAPIs.
+- [#2474](https://github.com/thanos-io/thanos/pull/2474) Store: fix a panic caused by concurrent memory access during block filtering.
+- [#2472](https://github.com/thanos-io/thanos/pull/2472) Compact: fix a bug where partial blocks were never deleted, causing spam of warnings.
+- [#2484](https://github.com/thanos-io/thanos/pull/2484) Query/Ruler: fix issue #2483, when web.route-prefix is set, it is added twice in HTTP router prefix.
 
 ## [v0.12.0](https://github.com/thanos-io/thanos/releases/tag/v0.12.0) - 2020.04.15
 
@@ -28,7 +40,6 @@ We use *breaking* word for marking changes that are not backward compatible (rel
 
 ### Added
 
-=======
 - [#2288](https://github.com/thanos-io/thanos/pull/2288) Ruler: fixes issue #2281, a bug causing incorrect parsing of query address with path prefix.
 - [#2238](https://github.com/thanos-io/thanos/pull/2238) Ruler: fixed issue #2204, where a bug in alert queue signaling filled up the queue and alerts were dropped.
 - [#2231](https://github.com/thanos-io/thanos/pull/2231) Bucket Web: sort chunks by thanos.downsample.resolution for better grouping.
