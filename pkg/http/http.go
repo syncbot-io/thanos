@@ -99,11 +99,11 @@ func NewHTTPClient(cfg ClientConfig, name string) (*http.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	client.Transport = &userAgentRoundTripper{name: userAgent, rt: client.Transport}
+	client.Transport = &userAgentRoundTripper{name: ThanosUserAgent, rt: client.Transport}
 	return client, nil
 }
 
-var userAgent = fmt.Sprintf("Thanos/%s", version.Version)
+var ThanosUserAgent = fmt.Sprintf("Thanos/%s", version.Version)
 
 type userAgentRoundTripper struct {
 	name string
@@ -163,7 +163,7 @@ func (c FileSDConfig) convert() (file.SDConfig, error) {
 }
 
 type AddressProvider interface {
-	Resolve(context.Context, []string)
+	Resolve(context.Context, []string) error
 	Addresses() []string
 }
 
@@ -259,6 +259,6 @@ func (c *Client) Discover(ctx context.Context) {
 }
 
 // Resolve refreshes and resolves the list of targets.
-func (c *Client) Resolve(ctx context.Context) {
-	c.provider.Resolve(ctx, append(c.fileSDCache.Addresses(), c.staticAddresses...))
+func (c *Client) Resolve(ctx context.Context) error {
+	return c.provider.Resolve(ctx, append(c.fileSDCache.Addresses(), c.staticAddresses...))
 }

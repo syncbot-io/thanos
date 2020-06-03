@@ -27,6 +27,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -36,22 +37,18 @@ import (
 )
 
 const (
-	defaultPrometheusVersion   = "v2.13.0"
+	defaultPrometheusVersion   = "v1.8.2-0.20200507164740-ecee9c8abfd1" // v2.18.1
 	defaultAlertmanagerVersion = "v0.20.0"
 	defaultMinioVersion        = "RELEASE.2018-10-06T00-15-16Z"
 
 	// Space delimited list of versions.
-	promVersionsEnvVar    = "THANOS_TEST_PROMETHEUS_VERSIONS"
+	promPathsEnvVar       = "THANOS_TEST_PROMETHEUS_PATHS"
 	alertmanagerBinEnvVar = "THANOS_TEST_ALERTMANAGER_PATH"
 	minioBinEnvVar        = "THANOS_TEST_MINIO_PATH"
 )
 
 func PrometheusBinary() string {
-	return prometheusBin(defaultPrometheusVersion)
-}
-
-func prometheusBin(version string) string {
-	return fmt.Sprintf("prometheus-%s", version)
+	return "prometheus-" + defaultPrometheusVersion
 }
 
 func AlertmanagerBinary() string {
@@ -76,7 +73,7 @@ type Prometheus struct {
 	dir     string
 	db      *tsdb.DB
 	prefix  string
-	version string
+	binPath string
 
 	running            bool
 	cmd                *exec.Cmd
@@ -89,21 +86,20 @@ func NewTSDB() (*tsdb.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return tsdb.Open(dir, nil, nil, &tsdb.Options{
-		BlockRanges:       []int64{2 * 3600 * 1000},
-		RetentionDuration: math.MaxInt64,
-	})
+	opts := tsdb.DefaultOptions()
+	opts.RetentionDuration = math.MaxInt64
+	return tsdb.Open(dir, nil, nil, opts)
 }
 
 func ForeachPrometheus(t *testing.T, testFn func(t testing.TB, p *Prometheus)) {
-	vers := os.Getenv(promVersionsEnvVar)
-	if vers == "" {
-		vers = defaultPrometheusVersion
+	paths := os.Getenv(promPathsEnvVar)
+	if paths == "" {
+		paths = PrometheusBinary()
 	}
 
-	for _, ver := range strings.Split(vers, " ") {
-		if ok := t.Run(ver, func(t *testing.T) {
-			p, err := newPrometheus(ver, "")
+	for _, path := range strings.Split(paths, " ") {
+		if ok := t.Run(path, func(t *testing.T) {
+			p, err := newPrometheus(path, "")
 			testutil.Ok(t, err)
 
 			testFn(t, p)
@@ -115,7 +111,8 @@ func ForeachPrometheus(t *testing.T, testFn func(t testing.TB, p *Prometheus)) {
 }
 
 // NewPrometheus creates a new test Prometheus instance that will listen on local address.
-// DEPRECATED: Use ForeachPrometheus instead.
+// Use ForeachPrometheus if you want to test against set of Prometheus versions.
+// TODO(bwplotka): Improve it with https://github.com/thanos-io/thanos/issues/758.
 func NewPrometheus() (*Prometheus, error) {
 	return newPrometheus("", "")
 }
@@ -125,9 +122,9 @@ func NewPrometheusOnPath(prefix string) (*Prometheus, error) {
 	return newPrometheus("", prefix)
 }
 
-func newPrometheus(version string, prefix string) (*Prometheus, error) {
-	if version == "" {
-		version = defaultPrometheusVersion
+func newPrometheus(binPath string, prefix string) (*Prometheus, error) {
+	if binPath == "" {
+		binPath = PrometheusBinary()
 	}
 
 	db, err := NewTSDB()
@@ -145,7 +142,7 @@ func newPrometheus(version string, prefix string) (*Prometheus, error) {
 		dir:     db.Dir(),
 		db:      db,
 		prefix:  prefix,
-		version: version,
+		binPath: binPath,
 		addr:    "<prometheus-not-started>",
 	}, nil
 }
@@ -187,7 +184,7 @@ func (p *Prometheus) start() error {
 		"--config.file=" + filepath.Join(p.db.Dir(), "prometheus.yml"),
 	}, extra...)
 
-	p.cmd = exec.Command(prometheusBin(p.version), args...)
+	p.cmd = exec.Command(p.binPath, args...)
 	p.cmd.SysProcAttr = SysProcAttr()
 
 	go func() {
@@ -275,7 +272,7 @@ func (p *Prometheus) cleanup() error {
 // Appender returns a new appender to populate the Prometheus instance with data.
 // All appenders must be closed before Start is called and no new ones must be opened
 // afterwards.
-func (p *Prometheus) Appender() tsdb.Appender {
+func (p *Prometheus) Appender() storage.Appender {
 	if p.running {
 		panic("Appender must not be called after start")
 	}
@@ -410,11 +407,17 @@ func createBlock(
 	resolution int64,
 	tombstones bool,
 ) (id ulid.ULID, err error) {
-	h, err := tsdb.NewHead(nil, nil, nil, 10000000000)
+	chunksRootDir := filepath.Join(dir, "chunks")
+	h, err := tsdb.NewHead(nil, nil, nil, 10000000000, chunksRootDir, nil, tsdb.DefaultStripeSize, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create head block")
 	}
-	defer runutil.CloseWithErrCapture(&err, h, "TSDB Head")
+	defer func() {
+		runutil.CloseWithErrCapture(&err, h, "TSDB Head")
+		if e := os.RemoveAll(chunksRootDir); e != nil {
+			err = errors.Wrap(e, "delete chunks dir")
+		}
+	}()
 
 	var g errgroup.Group
 	var timeStepSize = (maxt - mint) / int64(numSamples+1)
