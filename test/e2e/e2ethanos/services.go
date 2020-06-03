@@ -36,7 +36,7 @@ var defaultBackoffConfig = util.BackoffConfig{
 
 // TODO(bwplotka): Run against multiple?
 func DefaultPrometheusImage() string {
-	return "quay.io/prometheus/prometheus:v2.16.0"
+	return "quay.io/prometheus/prometheus:v2.18.1"
 }
 
 func DefaultAlertmanagerImage() string {
@@ -111,7 +111,7 @@ func NewPrometheusWithSidecar(sharedDir string, netName string, name string, con
 	return prom, sidecar, nil
 }
 
-func NewQuerier(sharedDir string, name string, storeAddresses []string, fileSDStoreAddresses []string) (*Service, error) {
+func NewQuerier(sharedDir string, name string, storeAddresses, fileSDStoreAddresses, ruleAddresses []string) (*Service, error) {
 	const replicaLabel = "replica"
 
 	args := e2e.BuildArgs(map[string]string{
@@ -127,6 +127,10 @@ func NewQuerier(sharedDir string, name string, storeAddresses []string, fileSDSt
 	})
 	for _, addr := range storeAddresses {
 		args = append(args, "--store="+addr)
+	}
+
+	for _, addr := range ruleAddresses {
+		args = append(args, "--rule="+addr)
 	}
 
 	if len(fileSDStoreAddresses) > 0 {
@@ -175,8 +179,9 @@ func NewReceiver(sharedDir string, networkName string, name string, replicationF
 	}
 
 	dir := filepath.Join(sharedDir, "data", "receive", name)
+	dataDir := filepath.Join(dir, "data")
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "receive", name)
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dataDir, 0777); err != nil {
 		return nil, errors.Wrap(err, "create receive dir")
 	}
 	b, err := json.Marshal(hashring)
@@ -199,7 +204,7 @@ func NewReceiver(sharedDir string, networkName string, name string, replicationF
 			"--http-address":                            ":80",
 			"--remote-write.address":                    ":81",
 			"--label":                                   fmt.Sprintf(`receive="%s"`, name),
-			"--tsdb.path":                               container,
+			"--tsdb.path":                               filepath.Join(container, "data"),
 			"--log.level":                               logLevel,
 			"--receive.replication-factor":              strconv.Itoa(replicationFactor),
 			"--receive.local-endpoint":                  localEndpoint,

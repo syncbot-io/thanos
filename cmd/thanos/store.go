@@ -45,7 +45,7 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
 	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
 
-	dataDir := cmd.Flag("data-dir", "Data directory in which to cache remote blocks.").
+	dataDir := cmd.Flag("data-dir", "Local data directory used for caching purposes (index-header, in-mem cache items and meta.jsons). If removed, no data will be lost, just store will have to rebuild the cache. NOTE: Putting raw blocks here will not cause the store to read them. For such use cases use Prometheus + sidecar.").
 		Default("./data").String()
 
 	indexCacheSize := cmd.Flag("index-cache-size", "Maximum size of items held in the in-memory index cache. Ignored if --index-cache.config or --index-cache.config-file option is specified.").
@@ -53,6 +53,10 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 
 	indexCacheConfig := extflag.RegisterPathOrContent(cmd, "index-cache.config",
 		"YAML file that contains index cache configuration. See format details: https://thanos.io/components/store.md/#index-cache",
+		false)
+
+	cachingBucketConfig := extflag.RegisterPathOrContent(extflag.HiddenCmdClause(cmd), "store.caching-bucket.config",
+		"YAML that contains configuration for caching bucket. Experimental feature, with high risk of changes. See format details: https://thanos.io/components/store.md/#caching-bucket",
 		false)
 
 	chunkPoolSize := cmd.Flag("chunk-pool-size", "Maximum size of concurrently allocatable bytes reserved strictly to reuse for chunks in memory.").
@@ -83,13 +87,9 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 
 	selectorRelabelConf := regSelectorRelabelFlags(cmd)
 
-	// TODO(bwplotka): Remove in v0.13.0 if no issues.
-	disableIndexHeader := cmd.Flag("store.disable-index-header", "If specified, Store Gateway will use index-cache.json for each block instead of recreating binary index-header").
-		Hidden().Default("false").Bool()
-
 	postingOffsetsInMemSampling := cmd.Flag("store.index-header-posting-offsets-in-mem-sampling", "Controls what is the ratio of postings offsets store will hold in memory. "+
 		"Larger value will keep less offsets, which will increase CPU cycles needed for query touching those postings. It's meant for setups that want low baseline memory pressure and where less traffic is expected. "+
-		"On the contrary, smaller value will increase baseline memory usage, but improve latency slightly. 1 will keep all in memory. Default value is the same as in Prometheus which gives a good balance. This works only when --store.disable-index-header is NOT specified.").
+		"On the contrary, smaller value will increase baseline memory usage, but improve latency slightly. 1 will keep all in memory. Default value is the same as in Prometheus which gives a good balance.").
 		Hidden().Default(fmt.Sprintf("%v", store.DefaultPostingOffsetInMemorySampling)).Int()
 
 	enablePostingsCompression := cmd.Flag("experimental.enable-index-cache-postings-compression", "If true, Store Gateway will reencode and compress postings before storing them into cache. Compressed postings take about 10% of the original size.").
@@ -142,13 +142,13 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 			},
 			selectorRelabelConf,
 			*advertiseCompatibilityLabel,
-			*disableIndexHeader,
 			*enablePostingsCompression,
 			time.Duration(*consistencyDelay),
 			time.Duration(*ignoreDeletionMarksDelay),
 			*webExternalPrefix,
 			*webPrefixHeaderName,
 			*postingOffsetsInMemSampling,
+			cachingBucketConfig,
 		)
 	}
 }
@@ -174,11 +174,12 @@ func runStore(
 	blockSyncConcurrency int,
 	filterConf *store.FilterConfig,
 	selectorRelabelConf *extflag.PathOrContent,
-	advertiseCompatibilityLabel, disableIndexHeader, enablePostingsCompression bool,
+	advertiseCompatibilityLabel, enablePostingsCompression bool,
 	consistencyDelay time.Duration,
 	ignoreDeletionMarksDelay time.Duration,
 	externalPrefix, prefixHeader string,
 	postingOffsetsInMemSampling int,
+	cachingBucketConfig *extflag.PathOrContent,
 ) error {
 	grpcProbe := prober.NewGRPC()
 	httpProbe := prober.NewHTTP()
@@ -212,6 +213,17 @@ func runStore(
 	bkt, err := client.NewBucket(logger, confContentYaml, reg, component.String())
 	if err != nil {
 		return errors.Wrap(err, "create bucket client")
+	}
+
+	cachingBucketConfigYaml, err := cachingBucketConfig.Content()
+	if err != nil {
+		return errors.Wrap(err, "get caching bucket configuration")
+	}
+	if len(cachingBucketConfigYaml) > 0 {
+		bkt, err = storecache.NewCachingBucketFromYaml(cachingBucketConfigYaml, bkt, logger, reg)
+		if err != nil {
+			return errors.Wrap(err, "create caching bucket")
+		}
 	}
 
 	relabelContentYaml, err := selectorRelabelConf.Content()
@@ -264,9 +276,6 @@ func runStore(
 		return errors.Wrap(err, "meta fetcher")
 	}
 
-	if !disableIndexHeader {
-		level.Info(logger).Log("msg", "index-header instead of index-cache.json enabled")
-	}
 	bs, err := store.NewBucketStore(
 		logger,
 		reg,
@@ -281,9 +290,9 @@ func runStore(
 		blockSyncConcurrency,
 		filterConf,
 		advertiseCompatibilityLabel,
-		!disableIndexHeader,
 		enablePostingsCompression,
 		postingOffsetsInMemSampling,
+		false,
 	)
 	if err != nil {
 		return errors.Wrap(err, "create object storage store")
@@ -325,7 +334,7 @@ func runStore(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, component, grpcProbe, bs,
+		s := grpcserver.New(logger, reg, tracer, component, grpcProbe, bs, nil,
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),

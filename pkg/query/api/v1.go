@@ -26,6 +26,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -38,10 +39,14 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/query"
+	"github.com/thanos-io/thanos/pkg/rules"
+	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
@@ -102,11 +107,13 @@ type API struct {
 	logger          log.Logger
 	queryableCreate query.QueryableCreator
 	queryEngine     *promql.Engine
+	ruleGroups      rules.UnaryClient
 
 	enableAutodownsampling                 bool
 	enablePartialResponse                  bool
 	replicaLabels                          []string
 	reg                                    prometheus.Registerer
+	storeSet                               *query.StoreSet
 	defaultInstantQueryMaxSourceResolution time.Duration
 
 	now func() time.Time
@@ -116,12 +123,14 @@ type API struct {
 func NewAPI(
 	logger log.Logger,
 	reg *prometheus.Registry,
+	storeSet *query.StoreSet,
 	qe *promql.Engine,
 	c query.QueryableCreator,
 	enableAutodownsampling bool,
 	enablePartialResponse bool,
 	replicaLabels []string,
 	defaultInstantQueryMaxSourceResolution time.Duration,
+	ruleGroups rules.UnaryClient,
 ) *API {
 	return &API{
 		logger:                                 logger,
@@ -131,7 +140,9 @@ func NewAPI(
 		enablePartialResponse:                  enablePartialResponse,
 		replicaLabels:                          replicaLabels,
 		reg:                                    reg,
+		storeSet:                               storeSet,
 		defaultInstantQueryMaxSourceResolution: defaultInstantQueryMaxSourceResolution,
+		ruleGroups:                             ruleGroups,
 
 		now: time.Now,
 	}
@@ -168,11 +179,14 @@ func (api *API) Register(r *route.Router, tracer opentracing.Tracer, logger log.
 
 	r.Get("/labels", instr("label_names", api.labelNames))
 	r.Post("/labels", instr("label_names", api.labelNames))
+
+	r.Get("/stores", instr("stores", api.stores))
+	r.Get("/rules", instr("rules", NewRulesHandler(api.ruleGroups)))
 }
 
 type queryData struct {
-	ResultType promql.ValueType `json:"resultType"`
-	Result     promql.Value     `json:"result"`
+	ResultType parser.ValueType `json:"resultType"`
+	Result     parser.Value     `json:"result"`
 
 	// Additional Thanos Response field.
 	Warnings []error `json:"warnings,omitempty"`
@@ -483,7 +497,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 
 	var matcherSets [][]*labels.Matcher
 	for _, s := range r.Form["match[]"] {
-		matchers, err := promql.ParseMetricSelector(s)
+		matchers, err := parser.ParseMetricSelector(s)
 		if err != nil {
 			return nil, nil, &ApiError{errorBadData, err}
 		}
@@ -518,7 +532,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 		sets     []storage.SeriesSet
 	)
 	for _, mset := range matcherSets {
-		s, warns, err := q.Select(nil, mset...)
+		s, warns, err := q.Select(false, nil, mset...)
 		if err != nil {
 			return nil, nil, &ApiError{errorExec, err}
 		}
@@ -526,7 +540,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 		sets = append(sets, s)
 	}
 
-	set := storage.NewMergeSeriesSet(sets, nil)
+	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
 	for set.Next() {
 		metrics = append(metrics, set.At().Labels())
 	}
@@ -625,4 +639,37 @@ func (api *API) labelNames(r *http.Request) (interface{}, []error, *ApiError) {
 	}
 
 	return names, warnings, nil
+}
+
+func (api *API) stores(r *http.Request) (interface{}, []error, *ApiError) {
+	statuses := make(map[string][]query.StoreStatus)
+	for _, status := range api.storeSet.GetStoreStatus() {
+		statuses[status.StoreType.String()] = append(statuses[status.StoreType.String()], status)
+	}
+	return statuses, nil, nil
+}
+
+// NewRulesHandler created handler compatible with HTTP /api/v1/rules https://prometheus.io/docs/prometheus/latest/querying/api/#rules
+// which uses gRPC Unary Rules API.
+func NewRulesHandler(client rules.UnaryClient) func(*http.Request) (interface{}, []error, *ApiError) {
+	return func(request *http.Request) (interface{}, []error, *ApiError) {
+		typeParam := request.URL.Query().Get("type")
+		typ, ok := rulespb.RulesRequest_Type_value[strings.ToUpper(typeParam)]
+		if !ok {
+			if typeParam != "" {
+				return nil, nil, &ApiError{errorBadData, errors.Errorf("invalid rules parameter type='%v'", typeParam)}
+			}
+			typ = int32(rulespb.RulesRequest_ALL)
+		}
+
+		req := &rulespb.RulesRequest{
+			Type:                    rulespb.RulesRequest_Type(typ),
+			PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
+		}
+		groups, warnings, err := client.Rules(request.Context(), req)
+		if err != nil {
+			return nil, nil, &ApiError{ErrorInternal, errors.Errorf("error retrieving rules: %v", err)}
+		}
+		return groups, warnings, nil
+	}
 }

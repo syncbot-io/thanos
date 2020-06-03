@@ -60,9 +60,8 @@ func main() {
 	registerQuery(cmds, app)
 	registerRule(cmds, app)
 	registerCompact(cmds, app)
-	registerBucket(cmds, app, "bucket")
+	registerTools(cmds, app)
 	registerReceive(cmds, app)
-	registerChecks(cmds, app, "check")
 
 	cmd, err := app.Parse(os.Args[1:])
 	if err != nil {
@@ -236,7 +235,7 @@ func reload(logger log.Logger, cancel <-chan struct{}, r chan<- struct{}) error 
 			level.Info(logger).Log("msg", "caught signal. Reloading.", "signal", s)
 			select {
 			case r <- struct{}{}:
-				level.Info(logger).Log("msg", "relaod dispatched.")
+				level.Info(logger).Log("msg", "reload dispatched.")
 			default:
 			}
 		case <-cancel:

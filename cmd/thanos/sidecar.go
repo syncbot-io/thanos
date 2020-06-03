@@ -25,11 +25,13 @@ import (
 	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/exthttp"
 	"github.com/thanos-io/thanos/pkg/extprom"
+	thanoshttp "github.com/thanos-io/thanos/pkg/http"
 	thanosmodel "github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/reloader"
+	"github.com/thanos-io/thanos/pkg/rules"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
@@ -38,52 +40,22 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
-
 	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
 	cmd := app.Command(component.Sidecar.String(), "sidecar for Prometheus server")
-
-	httpBindAddr, httpGracePeriod := regHTTPFlags(cmd)
-	grpcBindAddr, grpcGracePeriod, grpcCert, grpcKey, grpcClientCA := regGRPCFlags(cmd)
-
-	promURL := cmd.Flag("prometheus.url", "URL at which to reach Prometheus's API. For better performance use local network.").
-		Default("http://localhost:9090").URL()
-
-	promReadyTimeout := cmd.Flag("prometheus.ready_timeout", "Maximum time to wait for the Prometheus instance to start up").
-		Default("10m").Duration()
-
-	connectionPoolSize := cmd.Flag("receive.connection-pool-size", "Controls the http MaxIdleConns. Default is 0, which is unlimited").Int()
-	connectionPoolSizePerHost := cmd.Flag("receive.connection-pool-size-per-host", "Controls the http MaxIdleConnsPerHost").Default("100").Int()
-
-	dataDir := cmd.Flag("tsdb.path", "Data directory of TSDB.").
-		Default("./data").String()
-
-	reloaderCfgFile := cmd.Flag("reloader.config-file", "Config file watched by the reloader.").
-		Default("").String()
-
-	reloaderCfgOutputFile := cmd.Flag("reloader.config-envsubst-file", "Output file for environment variable substituted config file.").
-		Default("").String()
-
-	reloaderRuleDirs := cmd.Flag("reloader.rule-dir", "Rule directories for the reloader to refresh (repeated field).").Strings()
-
-	objStoreConfig := regCommonObjStoreFlags(cmd, "", false)
-
-	uploadCompacted := cmd.Flag("shipper.upload-compacted", "If true sidecar will try to upload compacted blocks as well. Useful for migration purposes. Works only if compaction is disabled on Prometheus. Do it once and then disable the flag when done.").Default("false").Bool()
-
-	ignoreBlockSize := cmd.Flag("shipper.ignore-unequal-block-size", "If true sidecar will not require prometheus min and max block size flags to be set to the same value. Only use this if you want to keep long retention and compaction enabled on your Prometheus instance, as in the worst case it can result in ~2h data loss for your Thanos bucket storage.").Default("false").Hidden().Bool()
-
-	minTime := thanosmodel.TimeOrDuration(cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
-		Default("0000-01-01T00:00:00Z"))
+	conf := &sidecarConfig{}
+	conf.registerFlag(cmd)
 
 	m[component.Sidecar.String()] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		rl := reloader.New(
 			log.With(logger, "component", "reloader"),
-			reloader.ReloadURLFromBase(*promURL),
-			*reloaderCfgFile,
-			*reloaderCfgOutputFile,
-			*reloaderRuleDirs,
+			extprom.WrapRegistererWithPrefix("thanos_sidecar_", reg),
+			reloader.ReloadURLFromBase(conf.prometheus.url),
+			conf.reloader.confFile,
+			conf.reloader.envVarConfFile,
+			conf.reloader.ruleDirectories,
 		)
 
 		return runSidecar(
@@ -91,24 +63,9 @@ func registerSidecar(m map[string]setupFunc, app *kingpin.Application) {
 			logger,
 			reg,
 			tracer,
-			*grpcBindAddr,
-			time.Duration(*grpcGracePeriod),
-			*grpcCert,
-			*grpcKey,
-			*grpcClientCA,
-			*httpBindAddr,
-			time.Duration(*httpGracePeriod),
-			*promURL,
-			*promReadyTimeout,
-			*dataDir,
-			objStoreConfig,
 			rl,
-			*uploadCompacted,
-			*ignoreBlockSize,
 			component.Sidecar,
-			*minTime,
-			*connectionPoolSize,
-			*connectionPoolSizePerHost,
+			*conf,
 		)
 	}
 }
@@ -118,37 +75,23 @@ func runSidecar(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
-	grpcBindAddr string,
-	grpcGracePeriod time.Duration,
-	grpcCert string,
-	grpcKey string,
-	grpcClientCA string,
-	httpBindAddr string,
-	httpGracePeriod time.Duration,
-	promURL *url.URL,
-	promReadyTimeout time.Duration,
-	dataDir string,
-	objStoreConfig *extflag.PathOrContent,
 	reloader *reloader.Reloader,
-	uploadCompacted bool,
-	ignoreBlockSize bool,
 	comp component.Component,
-	limitMinTime thanosmodel.TimeOrDurationValue,
-	connectionPoolSize int,
-	connectionPoolSizePerHost int,
+	conf sidecarConfig,
 ) error {
 	var m = &promMetadata{
-		promURL: promURL,
+		promURL: conf.prometheus.url,
 
 		// Start out with the full time range. The shipper will constrain it later.
 		// TODO(fabxc): minimum timestamp is never adjusted if shipping is disabled.
-		mint: limitMinTime.PrometheusTimestamp(),
+		mint: conf.limitMinTime.PrometheusTimestamp(),
 		maxt: math.MaxInt64,
 
-		limitMinTime: limitMinTime,
+		limitMinTime: conf.limitMinTime,
+		client:       promclient.NewWithTracingClient(logger, "thanos-sidecar"),
 	}
 
-	confContentYaml, err := objStoreConfig.Content()
+	confContentYaml, err := conf.objStore.Content()
 	if err != nil {
 		return errors.Wrap(err, "getting object store config")
 	}
@@ -168,8 +111,8 @@ func runSidecar(
 	)
 
 	srv := httpserver.New(logger, reg, comp, httpProbe,
-		httpserver.WithListen(httpBindAddr),
-		httpserver.WithGracePeriod(httpGracePeriod),
+		httpserver.WithListen(conf.http.bindAddress),
+		httpserver.WithGracePeriod(time.Duration(conf.http.gracePeriod)),
 	)
 
 	g.Add(func() error {
@@ -199,7 +142,7 @@ func runSidecar(
 			// Only check Prometheus's flags when upload is enabled.
 			if uploads {
 				// Check prometheus's flags to ensure sane sidecar flags.
-				if err := validatePrometheus(ctx, logger, ignoreBlockSize, m); err != nil {
+				if err := validatePrometheus(ctx, m.client, logger, conf.shipper.ignoreBlockSize, m); err != nil {
 					return errors.Wrap(err, "validate Prometheus flags")
 				}
 			}
@@ -207,7 +150,7 @@ func runSidecar(
 			// Blocking query of external labels before joining as a Source Peer into gossip.
 			// We retry infinitely until we reach and fetch labels from our Prometheus.
 			err := runutil.Retry(2*time.Second, ctx.Done(), func() error {
-				if err := m.UpdateLabels(ctx, logger); err != nil {
+				if err := m.UpdateLabels(ctx); err != nil {
 					level.Warn(logger).Log(
 						"msg", "failed to fetch initial external labels. Is Prometheus running? Retrying",
 						"err", err,
@@ -240,7 +183,7 @@ func runSidecar(
 				iterCtx, iterCancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer iterCancel()
 
-				if err := m.UpdateLabels(iterCtx, logger); err != nil {
+				if err := m.UpdateLabels(iterCtx); err != nil {
 					level.Warn(logger).Log("msg", "heartbeat failed", "err", err)
 					promUp.Set(0)
 				} else {
@@ -265,23 +208,24 @@ func runSidecar(
 
 	{
 		t := exthttp.NewTransport()
-		t.MaxIdleConnsPerHost = connectionPoolSizePerHost
-		t.MaxIdleConns = connectionPoolSize
-		c := &http.Client{Transport: tracing.HTTPTripperware(logger, t)}
+		t.MaxIdleConnsPerHost = conf.connection.maxIdleConnsPerHost
+		t.MaxIdleConns = conf.connection.maxIdleConns
+		c := promclient.NewClient(&http.Client{Transport: tracing.HTTPTripperware(logger, t)}, logger, thanoshttp.ThanosUserAgent)
 
-		promStore, err := store.NewPrometheusStore(logger, c, promURL, component.Sidecar, m.Labels, m.Timestamps)
+		promStore, err := store.NewPrometheusStore(logger, c, conf.prometheus.url, component.Sidecar, m.Labels, m.Timestamps)
 		if err != nil {
 			return errors.Wrap(err, "create Prometheus store")
 		}
 
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), grpcCert, grpcKey, grpcClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"),
+			conf.grpc.tlsSrvCert, conf.grpc.tlsSrvKey, conf.grpc.tlsSrvClientCA)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, promStore,
-			grpcserver.WithListen(grpcBindAddr),
-			grpcserver.WithGracePeriod(grpcGracePeriod),
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, promStore, rules.NewPrometheus(conf.prometheus.url, c, m.Labels),
+			grpcserver.WithListen(conf.grpc.bindAddress),
+			grpcserver.WithGracePeriod(time.Duration(conf.grpc.gracePeriod)),
 			grpcserver.WithTLSConfig(tlsCfg),
 		)
 		g.Add(func() error {
@@ -308,7 +252,7 @@ func runSidecar(
 			}
 		}()
 
-		if err := promclient.IsWALDirAccessible(dataDir); err != nil {
+		if err := promclient.IsWALDirAccessible(conf.tsdb.path); err != nil {
 			level.Error(logger).Log("err", err)
 		}
 
@@ -316,6 +260,7 @@ func runSidecar(
 		g.Add(func() error {
 			defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
 
+			promReadyTimeout := conf.prometheus.readyTimeout
 			extLabelsCtx, cancel := context.WithTimeout(ctx, promReadyTimeout)
 			defer cancel()
 
@@ -329,10 +274,10 @@ func runSidecar(
 			}
 
 			var s *shipper.Shipper
-			if uploadCompacted {
-				s = shipper.NewWithCompacted(logger, reg, dataDir, bkt, m.Labels, metadata.SidecarSource)
+			if conf.shipper.uploadCompacted {
+				s = shipper.NewWithCompacted(logger, reg, conf.tsdb.path, bkt, m.Labels, metadata.SidecarSource)
 			} else {
-				s = shipper.New(logger, reg, dataDir, bkt, m.Labels, metadata.SidecarSource)
+				s = shipper.New(logger, reg, conf.tsdb.path, bkt, m.Labels, metadata.SidecarSource)
 			}
 
 			return runutil.Repeat(30*time.Second, ctx.Done(), func() error {
@@ -357,14 +302,14 @@ func runSidecar(
 	return nil
 }
 
-func validatePrometheus(ctx context.Context, logger log.Logger, ignoreBlockSize bool, m *promMetadata) error {
+func validatePrometheus(ctx context.Context, client *promclient.Client, logger log.Logger, ignoreBlockSize bool, m *promMetadata) error {
 	var (
 		flagErr error
 		flags   promclient.Flags
 	)
 
 	if err := runutil.Retry(2*time.Second, ctx.Done(), func() error {
-		if flags, flagErr = promclient.ConfiguredFlags(ctx, logger, m.promURL); flagErr != nil && flagErr != promclient.ErrFlagEndpointNotFound {
+		if flags, flagErr = client.ConfiguredFlags(ctx, m.promURL); flagErr != nil && flagErr != promclient.ErrFlagEndpointNotFound {
 			level.Warn(logger).Log("msg", "failed to get Prometheus flags. Is Prometheus running? Retrying", "err", flagErr)
 			return errors.Wrapf(flagErr, "fetch Prometheus flags")
 		}
@@ -403,10 +348,12 @@ type promMetadata struct {
 	labels labels.Labels
 
 	limitMinTime thanosmodel.TimeOrDurationValue
+
+	client *promclient.Client
 }
 
-func (s *promMetadata) UpdateLabels(ctx context.Context, logger log.Logger) error {
-	elset, err := promclient.ExternalLabels(ctx, logger, s.promURL)
+func (s *promMetadata) UpdateLabels(ctx context.Context) error {
+	elset, err := s.client.ExternalLabels(ctx, s.promURL)
 	if err != nil {
 		return err
 	}
@@ -456,4 +403,30 @@ func (s *promMetadata) Timestamps() (mint int64, maxt int64) {
 	defer s.mtx.Unlock()
 
 	return s.mint, s.maxt
+}
+
+type sidecarConfig struct {
+	http         httpConfig
+	grpc         grpcConfig
+	prometheus   prometheusConfig
+	connection   connConfig
+	tsdb         tsdbConfig
+	reloader     reloaderConfig
+	objStore     extflag.PathOrContent
+	shipper      shipperConfig
+	limitMinTime thanosmodel.TimeOrDurationValue
+}
+
+func (sc *sidecarConfig) registerFlag(cmd *kingpin.CmdClause) *sidecarConfig {
+	sc.http.registerFlag(cmd)
+	sc.grpc.registerFlag(cmd)
+	sc.prometheus.registerFlag(cmd)
+	sc.connection.registerFlag(cmd)
+	sc.tsdb.registerFlag(cmd)
+	sc.reloader.registerFlag(cmd)
+	sc.objStore = *regCommonObjStoreFlags(cmd, "", false)
+	sc.shipper.registerFlag(cmd)
+	cmd.Flag("min-time", "Start of time range limit to serve. Thanos sidecar will serve only metrics, which happened later than this value. Option can be a constant time in RFC3339 format or time duration relative to current time, such as -1d or 2h45m. Valid duration units are ms, s, m, h, d, w, y.").
+		Default("0000-01-01T00:00:00Z").SetValue(&sc.limitMinTime)
+	return sc
 }

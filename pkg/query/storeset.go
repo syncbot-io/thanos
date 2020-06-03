@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -36,18 +37,24 @@ type StoreSpec interface {
 	// NOTE: It is implementation responsibility to retry until context timeout, but a caller responsibility to manage
 	// given store connection.
 	Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []storepb.LabelSet, mint int64, maxt int64, storeType component.StoreAPI, err error)
+
 	// StrictStatic returns true if the StoreAPI has been statically defined and it is under a strict mode.
 	StrictStatic() bool
 }
 
+type RuleSpec interface {
+	// Addr returns RulesAPI Address for the rules spec. It is used as its ID.
+	Addr() string
+}
+
 type StoreStatus struct {
-	Name      string
-	LastCheck time.Time
-	LastError error
-	LabelSets []storepb.LabelSet
-	StoreType component.StoreAPI
-	MinTime   int64
-	MaxTime   int64
+	Name      string             `json:"name"`
+	LastCheck time.Time          `json:"last_check"`
+	LastError error              `json:"last_error"`
+	LabelSets []storepb.LabelSet `json:"label_sets"`
+	StoreType component.StoreAPI `json:"store_type"`
+	MinTime   int64              `json:"min_time"`
+	MaxTime   int64              `json:"max_time"`
 }
 
 type grpcStoreSpec struct {
@@ -73,7 +80,7 @@ func (s *grpcStoreSpec) Addr() string {
 
 // Metadata method for gRPC store API tries to reach host Info method until context timeout. If we are unable to get metadata after
 // that time, we assume that the host is unhealthy and return error.
-func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []storepb.LabelSet, mint int64, maxt int64, storeType component.StoreAPI, err error) {
+func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []storepb.LabelSet, mint int64, maxt int64, Type component.StoreAPI, err error) {
 	resp, err := client.Info(ctx, &storepb.InfoRequest{}, grpc.WaitForReady(true))
 	if err != nil {
 		return nil, 0, 0, nil, errors.Wrapf(err, "fetching store info from %s", s.addr)
@@ -85,15 +92,14 @@ func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient
 	return resp.LabelSets, resp.MinTime, resp.MaxTime, component.FromProto(resp.StoreType), nil
 }
 
-// storeSetNodeCollector is metric collector for Guge indicated number of available storeAPIs for Querier.
-// Collector is requires as we want atomic updates for all 'thanos_store_nodes_grpc_connections' series.
+// storeSetNodeCollector is a metric collector reporting the number of available storeAPIs for Querier.
+// A Collector is required as we want atomic updates for all 'thanos_store_nodes_grpc_connections' series.
 type storeSetNodeCollector struct {
 	mtx             sync.Mutex
 	storeNodes      map[component.StoreAPI]map[string]int
 	storePerExtLset map[string]int
 
 	connectionsDesc *prometheus.Desc
-	nodeInfoDesc    *prometheus.Desc
 }
 
 func newStoreSetNodeCollector() *storeSetNodeCollector {
@@ -103,13 +109,6 @@ func newStoreSetNodeCollector() *storeSetNodeCollector {
 			"thanos_store_nodes_grpc_connections",
 			"Number of gRPC connection to Store APIs. Opened connection means healthy store APIs available for Querier.",
 			[]string{"external_labels", "store_type"}, nil,
-		),
-		// TODO(bwplotka): Obsolete; Replaced by thanos_store_nodes_grpc_connections.
-		// Remove in next minor release.
-		nodeInfoDesc: prometheus.NewDesc(
-			"thanos_store_node_info",
-			"Deprecated, use thanos_store_nodes_grpc_connections instead.",
-			[]string{"external_labels"}, nil,
 		),
 	}
 }
@@ -134,7 +133,6 @@ func (c *storeSetNodeCollector) Update(nodes map[component.StoreAPI]map[string]i
 
 func (c *storeSetNodeCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.connectionsDesc
-	ch <- c.nodeInfoDesc
 }
 
 func (c *storeSetNodeCollector) Collect(ch chan<- prometheus.Metric) {
@@ -150,9 +148,6 @@ func (c *storeSetNodeCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(c.connectionsDesc, prometheus.GaugeValue, float64(occurrences), externalLabels, storeTypeStr)
 		}
 	}
-	for externalLabels, occur := range c.storePerExtLset {
-		ch <- prometheus.MustNewConstMetric(c.nodeInfoDesc, prometheus.GaugeValue, float64(occur), externalLabels)
-	}
 }
 
 // StoreSet maintains a set of active stores. It is backed up by Store Specifications that are dynamically fetched on
@@ -163,6 +158,7 @@ type StoreSet struct {
 	// Store specifications can change dynamically. If some store is missing from the list, we assuming it is no longer
 	// accessible and we close gRPC client for it.
 	storeSpecs          func() []StoreSpec
+	ruleSpecs           func() []RuleSpec
 	dialOpts            []grpc.DialOption
 	gRPCInfoCallTimeout time.Duration
 
@@ -179,11 +175,12 @@ type StoreSet struct {
 	unhealthyStoreTimeout time.Duration
 }
 
-// NewStoreSet returns a new set of stores from cluster peers and statically configured ones.
+// NewStoreSet returns a new set of store APIs and potentially Rules APIs from given specs.
 func NewStoreSet(
 	logger log.Logger,
 	reg *prometheus.Registry,
 	storeSpecs func() []StoreSpec,
+	ruleSpecs func() []RuleSpec,
 	dialOpts []grpc.DialOption,
 	unhealthyStoreTimeout time.Duration,
 ) *StoreSet {
@@ -198,10 +195,14 @@ func NewStoreSet(
 	if storeSpecs == nil {
 		storeSpecs = func() []StoreSpec { return nil }
 	}
+	if ruleSpecs == nil {
+		ruleSpecs = func() []RuleSpec { return nil }
+	}
 
 	ss := &StoreSet{
 		logger:                log.With(logger, "component", "storeset"),
 		storeSpecs:            storeSpecs,
+		ruleSpecs:             ruleSpecs,
 		dialOpts:              dialOpts,
 		storesMetric:          storesMetric,
 		gRPCInfoCallTimeout:   5 * time.Second,
@@ -212,12 +213,15 @@ func NewStoreSet(
 	return ss
 }
 
+// TODO(bwplotka): Consider moving storeRef out of this package and renaming it, as it also supports rules API.
 type storeRef struct {
 	storepb.StoreClient
 
 	mtx  sync.RWMutex
 	cc   *grpc.ClientConn
 	addr string
+	// If rule is not nil, then this store also supports rules API.
+	rule rulespb.RulesClient
 
 	// Meta (can change during runtime).
 	labelSets []storepb.LabelSet
@@ -243,6 +247,13 @@ func (s *storeRef) StoreType() component.StoreAPI {
 	defer s.mtx.RUnlock()
 
 	return s.storeType
+}
+
+func (s *storeRef) HasRulesAPI() bool {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	return s.rule != nil
 }
 
 func (s *storeRef) LabelSets() []storepb.LabelSet {
@@ -381,6 +392,11 @@ func (s *StoreSet) Update(ctx context.Context) {
 
 		stores[addr] = st
 		s.updateStoreStatus(st, nil)
+
+		if st.HasRulesAPI() {
+			level.Info(s.logger).Log("msg", "adding new rulesAPI to query storeset", "address", addr)
+		}
+
 		level.Info(s.logger).Log("msg", "adding new storeAPI to query storeset", "address", addr, "extLset", extLset)
 	}
 
@@ -394,19 +410,27 @@ func (s *StoreSet) Update(ctx context.Context) {
 
 func (s *StoreSet) getActiveStores(ctx context.Context, stores map[string]*storeRef) map[string]*storeRef {
 	var (
-		unique       = make(map[string]struct{})
+		// UNIQUE?
 		activeStores = make(map[string]*storeRef, len(stores))
 		mtx          sync.Mutex
 		wg           sync.WaitGroup
+
+		storeAddrSet = make(map[string]struct{})
+		ruleAddrSet  = make(map[string]struct{})
 	)
 
 	// Gather active stores map concurrently. Build new store if does not exist already.
+	for _, ruleSpec := range s.ruleSpecs() {
+		ruleAddrSet[ruleSpec.Addr()] = struct{}{}
+	}
+
+	// Gather healthy stores map concurrently. Build new store if does not exist already.
 	for _, storeSpec := range s.storeSpecs() {
-		if _, ok := unique[storeSpec.Addr()]; ok {
+		if _, ok := storeAddrSet[storeSpec.Addr()]; ok {
 			level.Warn(s.logger).Log("msg", "duplicated address in store nodes", "address", storeSpec.Addr())
 			continue
 		}
-		unique[storeSpec.Addr()] = struct{}{}
+		storeAddrSet[storeSpec.Addr()] = struct{}{}
 
 		wg.Add(1)
 		go func(spec StoreSpec) {
@@ -426,14 +450,20 @@ func (s *StoreSet) getActiveStores(ctx context.Context, stores map[string]*store
 					level.Warn(s.logger).Log("msg", "update of store node failed", "err", errors.Wrap(err, "dialing connection"), "address", addr)
 					return
 				}
-				st = &storeRef{StoreClient: storepb.NewStoreClient(conn), cc: conn, addr: addr, logger: s.logger}
+				var rule rulespb.RulesClient
+				if _, ok := ruleAddrSet[addr]; ok {
+					rule = rulespb.NewRulesClient(conn)
+				}
+
+				st = &storeRef{StoreClient: storepb.NewStoreClient(conn), storeType: component.UnknownStoreAPI, rule: rule, cc: conn, addr: addr, logger: s.logger}
 			}
 
 			// Check existing or new store. Is it healthy? What are current metadata?
 			labelSets, minTime, maxTime, storeType, err := spec.Metadata(ctx, st.StoreClient)
 			if err != nil {
-				if !seenAlready {
-					// Close only if new. Unactive `s.stores` will be closed later on.
+				if !seenAlready && !spec.StrictStatic() {
+					// Close only if new and not a strict static node.
+					// Unactive `s.stores` will be closed later on.
 					st.Close()
 				}
 				s.updateStoreStatus(st, err)
@@ -462,6 +492,11 @@ func (s *StoreSet) getActiveStores(ctx context.Context, stores map[string]*store
 	}
 	wg.Wait()
 
+	for ruleAddr := range ruleAddrSet {
+		if _, ok := storeAddrSet[ruleAddr]; !ok {
+			level.Warn(s.logger).Log("msg", "ignored rule store", "address", ruleAddr)
+		}
+	}
 	return activeStores
 }
 
@@ -514,6 +549,20 @@ func (s *StoreSet) Get() []store.Client {
 		stores = append(stores, st)
 	}
 	return stores
+}
+
+// GetRulesClients returns a list of all active rules clients.
+func (s *StoreSet) GetRulesClients() []rulespb.RulesClient {
+	s.storesMtx.RLock()
+	defer s.storesMtx.RUnlock()
+
+	rules := make([]rulespb.RulesClient, 0, len(s.stores))
+	for _, st := range s.stores {
+		if st.HasRulesAPI() {
+			rules = append(rules, st.rule)
+		}
+	}
+	return rules
 }
 
 func (s *StoreSet) Close() {
