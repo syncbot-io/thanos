@@ -17,6 +17,7 @@ import (
 
 	"github.com/cortexproject/cortex/integration/e2e"
 	"github.com/pkg/errors"
+
 	"github.com/thanos-io/thanos/pkg/promclient"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
@@ -31,7 +32,7 @@ func TestRulesAPI_Fanout(t *testing.T) {
 
 	s, err := e2e.NewScenario(netName)
 	testutil.Ok(t, err)
-	defer s.Close()
+	t.Cleanup(e2ethanos.CleanScenario(t, s))
 
 	rulesSubDir := filepath.Join("rules")
 	testutil.Ok(t, os.MkdirAll(filepath.Join(s.SharedDir(), rulesSubDir), os.ModePerm))
@@ -69,13 +70,14 @@ func TestRulesAPI_Fanout(t *testing.T) {
 		[]string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint(), r1.GRPCNetworkEndpoint(), r2.GRPCNetworkEndpoint()},
 		nil,
 		[]string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint(), r1.GRPCNetworkEndpoint(), r2.GRPCNetworkEndpoint()},
+		"",
 	)
 
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	testutil.Ok(t, q.WaitSumMetrics(e2e.Equals(4), "thanos_store_nodes_grpc_connections"))
 

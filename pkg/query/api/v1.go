@@ -41,7 +41,10 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+
+	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/query"
 	"github.com/thanos-io/thanos/pkg/rules"
 	"github.com/thanos-io/thanos/pkg/rules/rulespb"
@@ -105,15 +108,17 @@ type ApiFunc func(r *http.Request) (interface{}, []error, *ApiError)
 // them using the provided storage and query engine.
 type API struct {
 	logger          log.Logger
+	reg             prometheus.Registerer
+	gate            gate.Gate
 	queryableCreate query.QueryableCreator
 	queryEngine     *promql.Engine
 	ruleGroups      rules.UnaryClient
 
-	enableAutodownsampling                 bool
-	enableQueryPartialResponse             bool
-	enableRulePartialResponse              bool
-	replicaLabels                          []string
-	reg                                    prometheus.Registerer
+	enableAutodownsampling     bool
+	enableQueryPartialResponse bool
+	enableRulePartialResponse  bool
+	replicaLabels              []string
+
 	storeSet                               *query.StoreSet
 	defaultInstantQueryMaxSourceResolution time.Duration
 
@@ -127,25 +132,28 @@ func NewAPI(
 	storeSet *query.StoreSet,
 	qe *promql.Engine,
 	c query.QueryableCreator,
+	ruleGroups rules.UnaryClient,
 	enableAutodownsampling bool,
 	enableQueryPartialResponse bool,
 	enableRulePartialResponse bool,
 	replicaLabels []string,
 	defaultInstantQueryMaxSourceResolution time.Duration,
-	ruleGroups rules.UnaryClient,
+	maxConcurrentQueries int,
 ) *API {
 	return &API{
-		logger:                                 logger,
-		queryEngine:                            qe,
-		queryableCreate:                        c,
+		logger:          logger,
+		reg:             reg,
+		queryEngine:     qe,
+		queryableCreate: c,
+		gate:            gate.NewKeeper(extprom.WrapRegistererWithPrefix("thanos_query_concurrent_", reg)).NewGate(maxConcurrentQueries),
+		ruleGroups:      ruleGroups,
+
 		enableAutodownsampling:                 enableAutodownsampling,
 		enableQueryPartialResponse:             enableQueryPartialResponse,
 		enableRulePartialResponse:              enableRulePartialResponse,
 		replicaLabels:                          replicaLabels,
-		reg:                                    reg,
 		storeSet:                               storeSet,
 		defaultInstantQueryMaxSourceResolution: defaultInstantQueryMaxSourceResolution,
-		ruleGroups:                             ruleGroups,
 
 		now: time.Now,
 	}
@@ -318,6 +326,14 @@ func (api *API) query(r *http.Request) (interface{}, []error, *ApiError) {
 		return nil, nil, &ApiError{errorBadData, err}
 	}
 
+	tracing.DoInSpan(ctx, "query_gate_ismyturn", func(ctx context.Context) {
+		err = api.gate.Start(ctx)
+	})
+	if err != nil {
+		return nil, nil, &ApiError{errorExec, err}
+	}
+	defer api.gate.Done()
+
 	res := qry.Exec(ctx)
 	if res.Err != nil {
 		switch res.Err.(type) {
@@ -415,6 +431,14 @@ func (api *API) queryRange(r *http.Request) (interface{}, []error, *ApiError) {
 	if err != nil {
 		return nil, nil, &ApiError{errorBadData, err}
 	}
+
+	tracing.DoInSpan(ctx, "query_gate_ismyturn", func(ctx context.Context) {
+		err = api.gate.Start(ctx)
+	})
+	if err != nil {
+		return nil, nil, &ApiError{errorExec, err}
+	}
+	defer api.gate.Done()
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
@@ -530,17 +554,11 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 	defer runutil.CloseWithLogOnErr(api.logger, q, "queryable series")
 
 	var (
-		warnings []error
-		metrics  = []labels.Labels{}
-		sets     []storage.SeriesSet
+		metrics = []labels.Labels{}
+		sets    []storage.SeriesSet
 	)
 	for _, mset := range matcherSets {
-		s, warns, err := q.Select(false, nil, mset...)
-		if err != nil {
-			return nil, nil, &ApiError{errorExec, err}
-		}
-		warnings = append(warnings, warns...)
-		sets = append(sets, s)
+		sets = append(sets, q.Select(false, nil, mset...))
 	}
 
 	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
@@ -550,7 +568,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 	if set.Err() != nil {
 		return nil, nil, &ApiError{errorExec, set.Err()}
 	}
-	return metrics, warnings, nil
+	return metrics, set.Warnings(), nil
 }
 
 func Respond(w http.ResponseWriter, data interface{}, warnings []error) {

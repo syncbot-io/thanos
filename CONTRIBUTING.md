@@ -2,7 +2,7 @@
 
 This document explain the process of contributing to the Thanos project.
 
-First of all please follow the [code of conduct](CODE_OF_CONDUCT.md) in all your interactions with the project.
+First of all please follow the [CODE_OF_CONDUCT](https://github.com/thanos-io/thanos/blob/master/CODE_OF_CONDUCT.md) in all your interactions with the project.
 
 ## TOC
 
@@ -52,6 +52,14 @@ discuss the change you wish to make via issue or slack, or any other
 method with the owners of this repository before making a change.
 
 Adding a large new feature or/and component to Thanos should be done by first creating a [proposal](docs/proposals) document outlining the design decisions of the change, motivations for the change, and any alternatives that might have been considered.
+
+## General Naming
+
+In the code and documentation prefer non-offensive terminology, for example:
+
+* `allowlist` / `denylist` (instead of `whitelist` / `blacklist`)
+* `primary` / `replica` (instead of `master` / `slave`)
+* `openbox` / `closedbox` (instead of `whitebox` / `blackbox`)
 
 ## Components Naming
 
