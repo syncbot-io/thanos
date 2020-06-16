@@ -170,6 +170,12 @@ func GetWebPrefix(logger log.Logger, externalPrefix, prefixHeader string, r *htt
 		level.Warn(logger).Log("msg", "Could not parse value of UI external prefix", "prefix", prefix, "err", err)
 	}
 
+	// To use relative URLs we need the prefix to have trailing "/" so that we don't have to add the
+	// "/" everywhere in templates.
+	if prefix != "" {
+		prefix = prefix + "/"
+	}
+
 	return prefix
 }
 
@@ -183,10 +189,7 @@ func SanitizePrefix(prefix string) (string, error) {
 
 	// Remove double slashes, convert to absolute path.
 	sanitizedPrefix := strings.TrimPrefix(path.Clean(u.Path), ".")
-
-	if strings.HasSuffix(sanitizedPrefix, "/") {
-		sanitizedPrefix = strings.TrimSuffix(sanitizedPrefix, "/")
-	}
+	sanitizedPrefix = strings.TrimSuffix(sanitizedPrefix, "/")
 
 	return sanitizedPrefix, nil
 }
