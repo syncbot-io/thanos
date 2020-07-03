@@ -11,6 +11,12 @@ We use *breaking* word for marking changes that are not backward compatible (rel
 
 ## Unreleased
 
+### Fixed
+
+- [#2834](https://github.com/thanos-io/thanos/pull/2834) Query: Fix rendered JSON state value for rules and alerts should be in lowercase
+
+### Changed
+
 ## [v0.14.0-rc.1](https://github.com/thanos-io/thanos/releases/tag/v0.14.0-rc.1) - 2020.07.07
 
 ### Fixed
