@@ -5,6 +5,7 @@ package query
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
+	"github.com/pkg/errors"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -660,7 +662,7 @@ func TestQuerierStrict(t *testing.T) {
 	testutil.Equals(t, 2, len(storeSet.stores), "two static clients must remain available")
 	testutil.Equals(t, curMin, storeSet.stores[staticStoreAddr].minTime, "minimum time reported by the store node is different")
 	testutil.Equals(t, curMax, storeSet.stores[staticStoreAddr].maxTime, "minimum time reported by the store node is different")
-	testutil.NotOk(t, storeSet.storeStatuses[staticStoreAddr].LastError)
+	testutil.NotOk(t, storeSet.storeStatuses[staticStoreAddr].LastError.originalErr)
 }
 
 func TestStoreSet_Update_Rules(t *testing.T) {
@@ -777,4 +779,82 @@ func TestStoreSet_Update_Rules(t *testing.T) {
 			testutil.Equals(t, tc.expectedRules, gotRules)
 		})
 	}
+}
+
+type errThatMarshalsToEmptyDict struct {
+	msg string
+}
+
+// MarshalJSON marshals the error and returns and empty dict, not the error string.
+func (e *errThatMarshalsToEmptyDict) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]string{})
+}
+
+// Error returns the original, underlying string.
+func (e *errThatMarshalsToEmptyDict) Error() string {
+	return e.msg
+}
+
+// Test highlights that without wrapping the error, it is marshalled to empty dict {}, not its message.
+func TestStringError(t *testing.T) {
+	dictErr := &errThatMarshalsToEmptyDict{msg: "Error message"}
+	stringErr := &stringError{originalErr: dictErr}
+
+	storestatusMock := map[string]error{}
+	storestatusMock["dictErr"] = dictErr
+	storestatusMock["stringErr"] = stringErr
+
+	b, err := json.Marshal(storestatusMock)
+
+	testutil.Ok(t, err)
+	testutil.Equals(t, []byte(`{"dictErr":{},"stringErr":"Error message"}`), b, "expected to get proper results")
+}
+
+// Errors that usually marshal to empty dict should return the original error string.
+func TestUpdateStoreStateLastError(t *testing.T) {
+	tcs := []struct {
+		InputError      error
+		ExpectedLastErr string
+	}{
+		{errors.New("normal_err"), `"normal_err"`},
+		{nil, `null`},
+		{&errThatMarshalsToEmptyDict{"the error message"}, `"the error message"`},
+	}
+
+	for _, tc := range tcs {
+		mockStoreSet := &StoreSet{
+			storeStatuses: map[string]*StoreStatus{},
+		}
+		mockStoreRef := &storeRef{
+			addr: "testStore",
+		}
+
+		mockStoreSet.updateStoreStatus(mockStoreRef, tc.InputError)
+
+		b, err := json.Marshal(mockStoreSet.storeStatuses["testStore"].LastError)
+		testutil.Ok(t, err)
+		testutil.Equals(t, tc.ExpectedLastErr, string(b))
+	}
+}
+
+func TestUpdateStoreStateForgetsPreviousErrors(t *testing.T) {
+	mockStoreSet := &StoreSet{
+		storeStatuses: map[string]*StoreStatus{},
+	}
+	mockStoreRef := &storeRef{
+		addr: "testStore",
+	}
+
+	mockStoreSet.updateStoreStatus(mockStoreRef, errors.New("test err"))
+
+	b, err := json.Marshal(mockStoreSet.storeStatuses["testStore"].LastError)
+	testutil.Ok(t, err)
+	testutil.Equals(t, `"test err"`, string(b))
+
+	// updating status without and error should clear the previous one.
+	mockStoreSet.updateStoreStatus(mockStoreRef, nil)
+
+	b, err = json.Marshal(mockStoreSet.storeStatuses["testStore"].LastError)
+	testutil.Ok(t, err)
+	testutil.Equals(t, `null`, string(b))
 }
