@@ -67,6 +67,9 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	maxConcurrentQueries := cmd.Flag("query.max-concurrent", "Maximum number of queries processed concurrently by query node.").
 		Default("20").Int()
 
+	maxConcurrentSelects := cmd.Flag("query.max-concurrent-select", "Maximum number of select requests made concurrently per a query.").
+		Default("4").Int()
+
 	queryReplicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter. Data includes time series, recording rules, and alerting rules.").
 		Strings()
 
@@ -138,6 +141,19 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 
 		promql.SetDefaultEvaluationInterval(time.Duration(*defaultEvaluationInterval))
 
+		flagsMap := map[string]string{}
+
+		// Exclude kingpin default flags to expose only Thanos ones.
+		boilerplateFlags := kingpin.New("", "").Version("")
+
+		for _, f := range cmd.Model().Flags {
+			if boilerplateFlags.GetFlag(f.Name) != nil {
+				continue
+			}
+
+			flagsMap[f.Name] = f.Value.String()
+		}
+
 		return runQuery(
 			g,
 			logger,
@@ -159,10 +175,12 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			*webExternalPrefix,
 			*webPrefixHeaderName,
 			*maxConcurrentQueries,
+			*maxConcurrentSelects,
 			time.Duration(*queryTimeout),
 			time.Duration(*storeResponseTimeout),
 			*queryReplicaLabels,
 			selectorLset,
+			flagsMap,
 			*stores,
 			*ruleEndpoints,
 			*enableAutodownsampling,
@@ -202,10 +220,12 @@ func runQuery(
 	webExternalPrefix string,
 	webPrefixHeaderName string,
 	maxConcurrentQueries int,
+	maxConcurrentSelects int,
 	queryTimeout time.Duration,
 	storeResponseTimeout time.Duration,
 	queryReplicaLabels []string,
 	selectorLset labels.Labels,
+	flagsMap map[string]string,
 	storeAddrs []string,
 	ruleAddrs []string,
 	enableAutodownsampling bool,
@@ -280,7 +300,7 @@ func runQuery(
 		)
 		proxy            = store.NewProxyStore(logger, reg, stores.Get, component.Query, selectorLset, storeResponseTimeout)
 		rulesProxy       = rules.NewProxy(logger, stores.GetRulesClients)
-		queryableCreator = query.NewQueryableCreator(logger, proxy)
+		queryableCreator = query.NewQueryableCreator(logger, reg, proxy, maxConcurrentSelects, queryTimeout)
 		engine           = promql.NewEngine(
 			promql.EngineOpts{
 				Logger: logger,
@@ -400,6 +420,7 @@ func runQuery(
 			enableQueryPartialResponse,
 			enableRulePartialResponse,
 			queryReplicaLabels,
+			flagsMap,
 			instantDefaultMaxSourceResolution,
 			maxConcurrentQueries,
 		)
