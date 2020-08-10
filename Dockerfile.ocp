@@ -15,8 +15,8 @@ FROM  registry.svc.ci.openshift.org/openshift/origin-v4.0:base
 LABEL io.k8s.display-name="OpenShift Thanos" \
       io.k8s.description="Highly available Prometheus setup with long term storage capabilities." \
       io.openshift.tags="prometheus,monitoring" \
-      maintainer="OpenShift Development <dev@lists.openshift.redhat.com>" \
-      version="v0.6.0"
+      summary="Highly available Prometheus setup with long term storage capabilities." \
+      maintainer="OpenShift Monitoring Team <team-monitoring@redhat.com>"
 
 COPY --from=builder /go/src/github.com/improbable-eng/thanos/thanos /bin/thanos
 
