@@ -1,20 +1,19 @@
 package e2e
 
 import (
+	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"io/ioutil"
-	"math"
-	"os"
+	"net"
 	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/go-kit/kit/log"
 	"github.com/pkg/errors"
-	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/thanos-io/thanos/pkg/runutil"
 
@@ -23,6 +22,7 @@ import (
 
 var (
 	dockerPortPattern = regexp.MustCompile(`^.*:(\d+)$`)
+	errMissingMetric  = errors.New("metric not found")
 )
 
 // ConcreteService represents microservice with optional ports which will be discoverable from docker
@@ -37,7 +37,7 @@ type ConcreteService struct {
 	env          map[string]string
 	user         string
 	command      *Command
-	readiness    *ReadinessProbe
+	readiness    ReadinessProbe
 
 	// Maps container ports to dynamically binded local ports.
 	networkPortsContainerToLocal map[int]int
@@ -54,7 +54,7 @@ func NewConcreteService(
 	name string,
 	image string,
 	command *Command,
-	readiness *ReadinessProbe,
+	readiness ReadinessProbe,
 	networkPorts ...int,
 ) *ConcreteService {
 	return &ConcreteService{
@@ -103,8 +103,8 @@ func (s *ConcreteService) Start(networkName, sharedDir string) (err error) {
 	}()
 
 	cmd := exec.Command("docker", s.buildDockerRunArgs(networkName, sharedDir)...)
-	cmd.Stdout = &LinePrefixWriter{prefix: s.name + ": ", wrapped: os.Stdout}
-	cmd.Stderr = &LinePrefixWriter{prefix: s.name + ": ", wrapped: os.Stderr}
+	cmd.Stdout = &LinePrefixLogger{prefix: s.name + ": ", logger: logger}
+	cmd.Stderr = &LinePrefixLogger{prefix: s.name + ": ", logger: logger}
 	if err = cmd.Start(); err != nil {
 		return err
 	}
@@ -141,7 +141,7 @@ func (s *ConcreteService) Start(networkName, sharedDir string) (err error) {
 		}
 		s.networkPortsContainerToLocal[containerPort] = localPort
 	}
-	fmt.Println("Ports for container:", s.containerName(), "Mapping:", s.networkPortsContainerToLocal)
+	logger.Log("Ports for container:", s.containerName(), "Mapping:", s.networkPortsContainerToLocal)
 	return nil
 }
 
@@ -150,10 +150,10 @@ func (s *ConcreteService) Stop() error {
 		return nil
 	}
 
-	fmt.Println("Stopping", s.name)
+	logger.Log("Stopping", s.name)
 
 	if out, err := RunCommandAndGetOutput("docker", "stop", "--time=30", s.containerName()); err != nil {
-		fmt.Println(string(out))
+		logger.Log(string(out))
 		return err
 	}
 	s.usedNetworkName = ""
@@ -166,10 +166,10 @@ func (s *ConcreteService) Kill() error {
 		return nil
 	}
 
-	fmt.Println("Killing", s.name)
+	logger.Log("Killing", s.name)
 
 	if out, err := RunCommandAndGetOutput("docker", "stop", "--time=0", s.containerName()); err != nil {
-		fmt.Println(string(out))
+		logger.Log(string(out))
 		return err
 	}
 	s.usedNetworkName = ""
@@ -218,6 +218,10 @@ func (s *ConcreteService) NetworkEndpointFor(networkName string, port int) strin
 	return fmt.Sprintf("%s:%d", containerName(networkName, s.name), port)
 }
 
+func (s *ConcreteService) SetReadinessProbe(probe ReadinessProbe) {
+	s.readiness = probe
+}
+
 func (s *ConcreteService) Ready() error {
 	if !s.isExpectedRunning() {
 		return fmt.Errorf("service %s is stopped", s.Name())
@@ -228,13 +232,7 @@ func (s *ConcreteService) Ready() error {
 		return nil
 	}
 
-	// Map the container port to the local port
-	localPort, ok := s.networkPortsContainerToLocal[s.readiness.port]
-	if !ok {
-		return fmt.Errorf("unknown port %d configured in the readiness probe", s.readiness.port)
-	}
-
-	return s.readiness.Ready(localPort)
+	return s.readiness.Ready(s)
 }
 
 func containerName(netName string, name string) string {
@@ -251,7 +249,12 @@ func (s *ConcreteService) WaitStarted() (err error) {
 	}
 
 	for s.retryBackoff.Reset(); s.retryBackoff.Ongoing(); {
-		err = exec.Command("docker", "inspect", s.containerName()).Run()
+		// Enforce a timeout on the command execution because we've seen some flaky tests
+		// stuck here.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+
+		err = exec.CommandContext(ctx, "docker", "inspect", s.containerName()).Run()
 		if err == nil {
 			return nil
 		}
@@ -299,14 +302,35 @@ func (s *ConcreteService) buildDockerRunArgs(networkName, sharedDir string) []st
 	}
 
 	// Disable entrypoint if required
-	if s.command.entrypointDisabled {
+	if s.command != nil && s.command.entrypointDisabled {
 		args = append(args, "--entrypoint", "")
 	}
 
 	args = append(args, s.image)
-	args = append(args, s.command.cmd)
-	args = append(args, s.command.args...)
+
+	if s.command != nil {
+		args = append(args, s.command.cmd)
+		args = append(args, s.command.args...)
+	}
+
 	return args
+}
+
+func (s *ConcreteService) Exec(command *Command) (string, error) {
+	args := []string{"exec", s.containerName()}
+	args = append(args, command.cmd)
+	args = append(args, command.args...)
+
+	cmd := exec.Command("docker", args...)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+
+	err := cmd.Run()
+	if err != nil {
+		return "", err
+	}
+
+	return stdout.String(), nil
 }
 
 type Command struct {
@@ -330,41 +354,96 @@ func NewCommandWithoutEntrypoint(cmd string, args ...string) *Command {
 	}
 }
 
-type ReadinessProbe struct {
-	port           int
-	path           string
-	expectedStatus int
+type ReadinessProbe interface {
+	Ready(service *ConcreteService) (err error)
 }
 
-func NewReadinessProbe(port int, path string, expectedStatus int) *ReadinessProbe {
-	return &ReadinessProbe{
-		port:           port,
-		path:           path,
-		expectedStatus: expectedStatus,
+// HTTPReadinessProbe checks readiness by making HTTP call and checking for expected HTTP status code
+type HTTPReadinessProbe struct {
+	port                     int
+	path                     string
+	expectedStatusRangeStart int
+	expectedStatusRangeEnd   int
+}
+
+func NewHTTPReadinessProbe(port int, path string, expectedStatusRangeStart, expectedStatusRangeEnd int) *HTTPReadinessProbe {
+	return &HTTPReadinessProbe{
+		port:                     port,
+		path:                     path,
+		expectedStatusRangeStart: expectedStatusRangeStart,
+		expectedStatusRangeEnd:   expectedStatusRangeEnd,
 	}
 }
 
-func (p *ReadinessProbe) Ready(localPort int) (err error) {
-	res, err := GetRequest(fmt.Sprintf("http://localhost:%d%s", localPort, p.path))
+func (p *HTTPReadinessProbe) Ready(service *ConcreteService) (err error) {
+	endpoint := service.Endpoint(p.port)
+	if endpoint == "" {
+		return fmt.Errorf("cannot get service endpoint for port %d", p.port)
+	} else if endpoint == "stopped" {
+		return errors.New("service has stopped")
+	}
+
+	res, err := GetRequest("http://" + endpoint + p.path)
 	if err != nil {
 		return err
 	}
 
 	defer runutil.ExhaustCloseWithErrCapture(&err, res.Body, "response readiness")
 
-	if res.StatusCode == p.expectedStatus {
+	if p.expectedStatusRangeStart <= res.StatusCode && res.StatusCode <= p.expectedStatusRangeEnd {
 		return nil
 	}
 
-	return fmt.Errorf("got no expected status code: %v, expected: %v", res.StatusCode, p.expectedStatus)
+	return fmt.Errorf("got status code: %v, expected code in range: [%v, %v]", res.StatusCode, p.expectedStatusRangeStart, p.expectedStatusRangeEnd)
 }
 
-type LinePrefixWriter struct {
-	prefix  string
-	wrapped io.Writer
+// TCPReadinessProbe checks readiness by ensure a TCP connection can be established.
+type TCPReadinessProbe struct {
+	port int
 }
 
-func (w *LinePrefixWriter) Write(p []byte) (n int, err error) {
+func NewTCPReadinessProbe(port int) *TCPReadinessProbe {
+	return &TCPReadinessProbe{
+		port: port,
+	}
+}
+
+func (p *TCPReadinessProbe) Ready(service *ConcreteService) (err error) {
+	endpoint := service.Endpoint(p.port)
+	if endpoint == "" {
+		return fmt.Errorf("cannot get service endpoint for port %d", p.port)
+	} else if endpoint == "stopped" {
+		return errors.New("service has stopped")
+	}
+
+	conn, err := net.DialTimeout("tcp", endpoint, time.Second)
+	if err != nil {
+		return err
+	}
+
+	return conn.Close()
+}
+
+// CmdReadinessProbe checks readiness by `Exec`ing a command (within container) which returns 0 to consider status being ready
+type CmdReadinessProbe struct {
+	cmd *Command
+}
+
+func NewCmdReadinessProbe(cmd *Command) *CmdReadinessProbe {
+	return &CmdReadinessProbe{cmd: cmd}
+}
+
+func (p *CmdReadinessProbe) Ready(service *ConcreteService) error {
+	_, err := service.Exec(p.cmd)
+	return err
+}
+
+type LinePrefixLogger struct {
+	prefix string
+	logger log.Logger
+}
+
+func (w *LinePrefixLogger) Write(p []byte) (n int, err error) {
 	for _, line := range strings.Split(string(p), "\n") {
 		// Skip empty lines
 		line = strings.TrimSpace(line)
@@ -373,8 +452,7 @@ func (w *LinePrefixWriter) Write(p []byte) (n int, err error) {
 		}
 
 		// Write the prefix + line to the wrapped writer
-		_, err := w.wrapped.Write([]byte(w.prefix + line + "\n"))
-		if err != nil {
+		if err := w.logger.Log(w.prefix + line); err != nil {
 			return 0, err
 		}
 	}
@@ -394,7 +472,7 @@ func NewHTTPService(
 	name string,
 	image string,
 	command *Command,
-	readiness *ReadinessProbe,
+	readiness ReadinessProbe,
 	httpPort int,
 	otherPorts ...int,
 ) *HTTPService {
@@ -404,7 +482,7 @@ func NewHTTPService(
 	}
 }
 
-func (s *HTTPService) metrics() (_ string, err error) {
+func (s *HTTPService) Metrics() (_ string, err error) {
 	// Map the container port to the local port
 	localPort := s.networkPortsContainerToLocal[s.httpPort]
 
@@ -425,6 +503,10 @@ func (s *HTTPService) metrics() (_ string, err error) {
 	return string(body), err
 }
 
+func (s *HTTPService) HTTPPort() int {
+	return s.httpPort
+}
+
 func (s *HTTPService) HTTPEndpoint() string {
 	return s.Endpoint(s.httpPort)
 }
@@ -437,102 +519,26 @@ func (s *HTTPService) NetworkHTTPEndpointFor(networkName string) string {
 	return s.NetworkEndpointFor(networkName, s.httpPort)
 }
 
-func sumValues(family *io_prometheus_client.MetricFamily) float64 {
-	sum := 0.0
-	for _, m := range family.Metric {
-		if m.GetGauge() != nil {
-			sum += m.GetGauge().GetValue()
-		} else if m.GetCounter() != nil {
-			sum += m.GetCounter().GetValue()
-		} else if m.GetHistogram() != nil {
-			sum += m.GetHistogram().GetSampleSum()
-		} else if m.GetSummary() != nil {
-			sum += m.GetSummary().GetSampleSum()
-		}
-	}
-	return sum
-}
-
-func Equals(value float64) func(sums ...float64) bool {
-	return func(sums ...float64) bool {
-		if len(sums) != 1 {
-			panic("equals: expected one value")
-		}
-		return sums[0] == value || math.IsNaN(sums[0]) && math.IsNaN(value)
-	}
-}
-
-func Greater(value float64) func(sums ...float64) bool {
-	return func(sums ...float64) bool {
-		if len(sums) != 1 {
-			panic("greater: expected one value")
-		}
-		return sums[0] > value
-	}
-}
-
-func Less(value float64) func(sums ...float64) bool {
-	return func(sums ...float64) bool {
-		if len(sums) != 1 {
-			panic("less: expected one value")
-		}
-		return sums[0] < value
-	}
-}
-
-// EqualsAmongTwo returns true if first sum is equal to the second.
-// NOTE: Be careful on scrapes in between of process that changes two metrics. Those are
-// usually not atomic.
-func EqualsAmongTwo(sums ...float64) bool {
-	if len(sums) != 2 {
-		panic("equalsAmongTwo: expected two values")
-	}
-	return sums[0] == sums[1]
-}
-
-// GreaterAmongTwo returns true if first sum is greater than second.
-// NOTE: Be careful on scrapes in between of process that changes two metrics. Those are
-// usually not atomic.
-func GreaterAmongTwo(sums ...float64) bool {
-	if len(sums) != 2 {
-		panic("greaterAmongTwo: expected two values")
-	}
-	return sums[0] > sums[1]
-}
-
-// LessAmongTwo returns true if first sum is smaller than second.
-// NOTE: Be careful on scrapes in between of process that changes two metrics. Those are
-// usually not atomic.
-func LessAmongTwo(sums ...float64) bool {
-	if len(sums) != 2 {
-		panic("lessAmongTwo: expected two values")
-	}
-	return sums[0] < sums[1]
-}
-
+// WaitSumMetrics waits for at least one instance of each given metric names to be present and their sums, returning true
+// when passed to given isExpected(...).
 func (s *HTTPService) WaitSumMetrics(isExpected func(sums ...float64) bool, metricNames ...string) error {
-	sums := make([]float64, len(metricNames))
+	return s.WaitSumMetricsWithOptions(isExpected, metricNames)
+}
+
+func (s *HTTPService) WaitSumMetricsWithOptions(isExpected func(sums ...float64) bool, metricNames []string, opts ...MetricsOption) error {
+	var (
+		sums    []float64
+		err     error
+		options = buildMetricsOptions(opts)
+	)
 
 	for s.retryBackoff.Reset(); s.retryBackoff.Ongoing(); {
-		metrics, err := s.metrics()
+		sums, err = s.SumMetrics(metricNames, opts...)
+		if options.WaitMissingMetrics && errors.Is(err, errMissingMetric) {
+			continue
+		}
 		if err != nil {
 			return err
-		}
-
-		var tp expfmt.TextParser
-		families, err := tp.TextToMetricFamilies(strings.NewReader(metrics))
-		if err != nil {
-			return err
-		}
-
-		for i, m := range metricNames {
-			sums[i] = 0.0
-
-			// Check if the metric is exported.
-			mf, ok := families[m]
-			if ok {
-				sums[i] = sumValues(mf)
-			}
 		}
 
 		if isExpected(sums...) {
@@ -542,5 +548,77 @@ func (s *HTTPService) WaitSumMetrics(isExpected func(sums ...float64) bool, metr
 		s.retryBackoff.Wait()
 	}
 
-	return fmt.Errorf("unable to find metrics %s with expected values. LastValues: %v", metricNames, sums)
+	return fmt.Errorf("unable to find metrics %s with expected values. Last error: %v. Last values: %v", metricNames, err, sums)
+}
+
+// SumMetrics returns the sum of the values of each given metric names.
+func (s *HTTPService) SumMetrics(metricNames []string, opts ...MetricsOption) ([]float64, error) {
+	options := buildMetricsOptions(opts)
+	sums := make([]float64, len(metricNames))
+
+	metrics, err := s.Metrics()
+	if err != nil {
+		return nil, err
+	}
+
+	var tp expfmt.TextParser
+	families, err := tp.TextToMetricFamilies(strings.NewReader(metrics))
+	if err != nil {
+		return nil, err
+	}
+
+	for i, m := range metricNames {
+		sums[i] = 0.0
+
+		// Get the metric family.
+		mf, ok := families[m]
+		if !ok {
+			return nil, errors.Wrapf(errMissingMetric, "metric=%s service=%s", m, s.name)
+		}
+
+		// Filter metrics.
+		metrics := filterMetrics(mf.GetMetric(), options)
+		if len(metrics) == 0 {
+			return nil, errors.Wrapf(errMissingMetric, "metric=%s service=%s", m, s.name)
+		}
+
+		sums[i] = sumValues(getValues(metrics, options))
+	}
+
+	return sums, nil
+}
+
+// WaitRemovedMetric waits until a metric disappear from the list of metrics exported by the service.
+func (s *HTTPService) WaitRemovedMetric(metricName string, opts ...MetricsOption) error {
+	options := buildMetricsOptions(opts)
+
+	for s.retryBackoff.Reset(); s.retryBackoff.Ongoing(); {
+		// Fetch metrics.
+		metrics, err := s.Metrics()
+		if err != nil {
+			return err
+		}
+
+		// Parse metrics.
+		var tp expfmt.TextParser
+		families, err := tp.TextToMetricFamilies(strings.NewReader(metrics))
+		if err != nil {
+			return err
+		}
+
+		// Get the metric family.
+		mf, ok := families[metricName]
+		if !ok {
+			return nil
+		}
+
+		// Filter metrics.
+		if len(filterMetrics(mf.GetMetric(), options)) == 0 {
+			return nil
+		}
+
+		s.retryBackoff.Wait()
+	}
+
+	return fmt.Errorf("the metric %s is still exported by %s", metricName, s.name)
 }
