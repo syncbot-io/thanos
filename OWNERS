@@ -1,7 +1,6 @@
 component: "Monitoring"
 
 reviewers:
-- brancz
 - kakkoyun
 - metalmatze
 - paulfantom
@@ -14,7 +13,6 @@ reviewers:
 - lilic
 
 approvers:
-- brancz
 - kakkoyun
 - metalmatze
 - paulfantom
@@ -25,3 +23,6 @@ approvers:
 - krasi-georgiev
 - bwplotka
 - lilic
+
+emeritus_approvers:
+- brancz
