@@ -12,15 +12,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fortytw2/leaktest"
 	"github.com/pkg/errors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/testutil"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 var testGRPCOpts = []grpc.DialOption{
@@ -130,8 +130,6 @@ func (s *testStores) CloseOne(addr string) {
 }
 
 func TestStoreSet_Update(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
-
 	stores, err := startTestStores([]testStoreMeta{
 		{
 			storeType: component.Sidecar,
@@ -499,8 +497,6 @@ func TestStoreSet_Update(t *testing.T) {
 }
 
 func TestStoreSet_Update_NoneAvailable(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 10*time.Second)()
-
 	st, err := startTestStores([]testStoreMeta{
 		{
 			extlsetFn: func(addr string) []storepb.LabelSet {
@@ -564,8 +560,6 @@ func TestStoreSet_Update_NoneAvailable(t *testing.T) {
 
 // TestQuerierStrict tests what happens when the strict mode is enabled/disabled.
 func TestQuerierStrict(t *testing.T) {
-	defer leaktest.CheckTimeout(t, 5*time.Second)()
-
 	st, err := startTestStores([]testStoreMeta{
 		{
 			minTime: 12345,
@@ -766,6 +760,7 @@ func TestStoreSet_Update_Rules(t *testing.T) {
 			testGRPCOpts, time.Minute)
 
 		t.Run(tc.name, func(t *testing.T) {
+			defer storeSet.Close()
 			storeSet.Update(context.Background())
 			testutil.Equals(t, tc.expectedStores, len(storeSet.stores))
 
@@ -795,7 +790,7 @@ func (e *errThatMarshalsToEmptyDict) Error() string {
 	return e.msg
 }
 
-// Test highlights that without wrapping the error, it is marshalled to empty dict {}, not its message.
+// Test highlights that without wrapping the error, it is marshaled to empty dict {}, not its message.
 func TestStringError(t *testing.T) {
 	dictErr := &errThatMarshalsToEmptyDict{msg: "Error message"}
 	stringErr := &stringError{originalErr: dictErr}
