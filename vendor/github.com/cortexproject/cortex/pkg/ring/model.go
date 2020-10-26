@@ -102,15 +102,15 @@ func (d *Desc) Ready(now time.Time, heartbeatTimeout time.Duration) error {
 	numTokens := 0
 	for id, ingester := range d.Ingesters {
 		if now.Sub(time.Unix(ingester.Timestamp, 0)) > heartbeatTimeout {
-			return fmt.Errorf("ingester %s past heartbeat timeout", id)
+			return fmt.Errorf("instance %s past heartbeat timeout", id)
 		} else if ingester.State != ACTIVE {
-			return fmt.Errorf("ingester %s in state %v", id, ingester.State)
+			return fmt.Errorf("instance %s in state %v", id, ingester.State)
 		}
 		numTokens += len(ingester.Tokens)
 	}
 
 	if numTokens == 0 {
-		return fmt.Errorf("Not ready: no tokens in ring")
+		return fmt.Errorf("no tokens in ring")
 	}
 	return nil
 }
@@ -410,6 +410,25 @@ func (d *Desc) getTokens() []TokenDesc {
 
 	sort.Sort(ByToken(tokens))
 	return tokens
+}
+
+// getTokensByZone returns instances tokens grouped by zone. Tokens within each zone
+// are guaranteed to be sorted.
+func (d *Desc) getTokensByZone() map[string][]TokenDesc {
+	zones := map[string][]TokenDesc{}
+
+	for key, ing := range d.Ingesters {
+		for _, token := range ing.Tokens {
+			zones[ing.Zone] = append(zones[ing.Zone], TokenDesc{Token: token, Ingester: key, Zone: ing.GetZone()})
+		}
+	}
+
+	// Ensure tokens are sorted within each zone.
+	for zone := range zones {
+		sort.Sort(ByToken(zones[zone]))
+	}
+
+	return zones
 }
 
 func GetOrCreateRingDesc(d interface{}) *Desc {
