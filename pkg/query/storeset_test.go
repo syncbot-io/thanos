@@ -216,10 +216,10 @@ func TestStoreSet_Update(t *testing.T) {
 
 		lset := st.LabelSets()
 		testutil.Equals(t, 2, len(lset))
-		testutil.Equals(t, "addr", lset[0].Labels[0].Name)
-		testutil.Equals(t, addr, lset[0].Labels[0].Value)
-		testutil.Equals(t, "a", lset[1].Labels[0].Name)
-		testutil.Equals(t, "b", lset[1].Labels[0].Value)
+		testutil.Equals(t, "addr", lset[0][0].Name)
+		testutil.Equals(t, addr, lset[0][0].Value)
+		testutil.Equals(t, "a", lset[1][0].Name)
+		testutil.Equals(t, "b", lset[1][0].Value)
 	}
 
 	// Check stats.
@@ -251,10 +251,10 @@ func TestStoreSet_Update(t *testing.T) {
 
 	lset := st.LabelSets()
 	testutil.Equals(t, 2, len(lset))
-	testutil.Equals(t, "addr", lset[0].Labels[0].Name)
-	testutil.Equals(t, addr, lset[0].Labels[0].Value)
-	testutil.Equals(t, "a", lset[1].Labels[0].Name)
-	testutil.Equals(t, "b", lset[1].Labels[0].Value)
+	testutil.Equals(t, "addr", lset[0][0].Name)
+	testutil.Equals(t, addr, lset[0][0].Value)
+	testutil.Equals(t, "a", lset[1][0].Name)
+	testutil.Equals(t, "b", lset[1][0].Value)
 	testutil.Equals(t, expected, storeSet.storesMetric.storeNodes)
 
 	// New big batch of storeAPIs.
@@ -772,196 +772,6 @@ func TestStoreSet_Update_Rules(t *testing.T) {
 			}
 
 			testutil.Equals(t, tc.expectedRules, gotRules)
-		})
-	}
-}
-
-func TestStoreSet_Rules_Discovery(t *testing.T) {
-	stores, err := startTestStores([]testStoreMeta{
-		{
-			extlsetFn: func(addr string) []storepb.LabelSet {
-				return []storepb.LabelSet{}
-			},
-			storeType: component.Sidecar,
-		},
-		{
-			extlsetFn: func(addr string) []storepb.LabelSet {
-				return []storepb.LabelSet{}
-			},
-			storeType: component.Rule,
-		},
-	})
-	testutil.Ok(t, err)
-	defer stores.Close()
-
-	type discoveryState struct {
-		name           string
-		storeSpecs     func() []StoreSpec
-		ruleSpecs      func() []RuleSpec
-		expectedStores int
-		expectedRules  int
-	}
-
-	for _, tc := range []struct {
-		states []discoveryState
-		name   string
-	}{
-		{
-			name: "StoreAPI and RulesAPI concurrent discovery",
-			states: []discoveryState{
-				{
-					name:           "no stores",
-					storeSpecs:     nil,
-					ruleSpecs:      nil,
-					expectedRules:  0,
-					expectedStores: 0,
-				},
-				{
-					name: "RulesAPI discovered",
-					storeSpecs: func() []StoreSpec {
-						return []StoreSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					ruleSpecs: func() []RuleSpec {
-						return []RuleSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					expectedRules:  1,
-					expectedStores: 1,
-				},
-			},
-		},
-
-		{
-			name: "StoreAPI discovery first, eventually discovered RulesAPI",
-			states: []discoveryState{
-				{
-					name:           "no stores",
-					storeSpecs:     nil,
-					ruleSpecs:      nil,
-					expectedRules:  0,
-					expectedStores: 0,
-				},
-				{
-					name: "StoreAPI discovered, no RulesAPI discovered",
-					storeSpecs: func() []StoreSpec {
-						return []StoreSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					expectedStores: 1,
-					expectedRules:  0,
-				},
-				{
-					name: "RulesAPI discovered",
-					storeSpecs: func() []StoreSpec {
-						return []StoreSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					ruleSpecs: func() []RuleSpec {
-						return []RuleSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					expectedStores: 1,
-					expectedRules:  1,
-				},
-			},
-		},
-
-		{
-			name: "RulesAPI discovery first, eventually discovered StoreAPI",
-			states: []discoveryState{
-				{
-					name:           "no stores",
-					storeSpecs:     nil,
-					ruleSpecs:      nil,
-					expectedRules:  0,
-					expectedStores: 0,
-				},
-				{
-					name:       "RulesAPI discovered, no StoreAPI discovered",
-					storeSpecs: nil,
-					ruleSpecs: func() []RuleSpec {
-						return []RuleSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					expectedStores: 0,
-					expectedRules:  0,
-				},
-				{
-					name: "StoreAPI discovered",
-					storeSpecs: func() []StoreSpec {
-						return []StoreSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					ruleSpecs: func() []RuleSpec {
-						return []RuleSpec{
-							NewGRPCStoreSpec(stores.orderAddrs[0], false),
-						}
-					},
-					expectedStores: 1,
-					expectedRules:  1,
-				},
-			},
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			currentState := 0
-
-			storeSet := NewStoreSet(nil, nil,
-				func() []StoreSpec {
-					if tc.states[currentState].storeSpecs == nil {
-						return nil
-					}
-
-					return tc.states[currentState].storeSpecs()
-				},
-				func() []RuleSpec {
-					if tc.states[currentState].ruleSpecs == nil {
-						return nil
-					}
-
-					return tc.states[currentState].ruleSpecs()
-				},
-				testGRPCOpts, time.Minute)
-
-			defer storeSet.Close()
-
-			for {
-				storeSet.Update(context.Background())
-				testutil.Equals(
-					t,
-					tc.states[currentState].expectedStores,
-					len(storeSet.stores),
-					"unexepected discovered stores in state %q",
-					tc.states[currentState].name,
-				)
-
-				gotRules := 0
-				for _, ref := range storeSet.stores {
-					if ref.HasRulesAPI() {
-						gotRules += 1
-					}
-				}
-				testutil.Equals(
-					t,
-					tc.states[currentState].expectedRules,
-					gotRules,
-					"unexpected discovered rules in state %q",
-					tc.states[currentState].name,
-				)
-
-				currentState = currentState + 1
-				if len(tc.states) == currentState {
-					break
-				}
-			}
 		})
 	}
 }
