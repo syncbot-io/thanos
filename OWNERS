@@ -4,25 +4,25 @@ reviewers:
 - kakkoyun
 - metalmatze
 - paulfantom
-- pgier
 - s-urbaniak
 - simonpasquier
 - squat
-- krasi-georgiev
 - bwplotka
 - lilic
+- dgrisonnet
 
 approvers:
 - kakkoyun
 - metalmatze
 - paulfantom
-- pgier
 - s-urbaniak
 - simonpasquier
 - squat
-- krasi-georgiev
 - bwplotka
 - lilic
+- dgrisonnet
 
 emeritus_approvers:
 - brancz
+- krasi-georgiev
+- pgier
