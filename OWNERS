@@ -2,27 +2,27 @@ component: "Monitoring"
 
 reviewers:
 - kakkoyun
-- metalmatze
 - paulfantom
 - s-urbaniak
 - simonpasquier
 - squat
 - bwplotka
-- lilic
 - dgrisonnet
+- jan--f
 
 approvers:
 - kakkoyun
-- metalmatze
 - paulfantom
 - s-urbaniak
 - simonpasquier
 - squat
 - bwplotka
-- lilic
 - dgrisonnet
+- jan--f
 
 emeritus_approvers:
+- metalmatze
+- lilic
 - brancz
 - krasi-georgiev
 - pgier
