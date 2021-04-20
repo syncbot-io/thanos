@@ -146,6 +146,7 @@ func (c Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketNa
 		uploadPartsCh <- uploadPartReq{PartNum: p}
 	}
 	close(uploadPartsCh)
+
 	// Receive each part number from the channel allowing three parallel uploads.
 	for w := 1; w <= opts.getNumThreads(); w++ {
 		go func(partSize int64) {
@@ -160,7 +161,7 @@ func (c Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketNa
 				// As a special case if partNumber is lastPartNumber, we
 				// calculate the offset based on the last part size.
 				if uploadReq.PartNum == lastPartNumber {
-					readOffset = (size - lastPartSize)
+					readOffset = size - lastPartSize
 					partSize = lastPartSize
 				}
 
@@ -168,8 +169,8 @@ func (c Client) putObjectMultipartStreamFromReadAt(ctx context.Context, bucketNa
 				sectionReader := newHook(io.NewSectionReader(reader, readOffset, partSize), opts.Progress)
 
 				// Proceed to upload the part.
-				objPart, err := c.uploadPart(ctx, bucketName, objectName, uploadID,
-					sectionReader, uploadReq.PartNum,
+				objPart, err := c.uploadPart(ctx, bucketName, objectName,
+					uploadID, sectionReader, uploadReq.PartNum,
 					"", "", partSize, opts.ServerSideEncryption)
 				if err != nil {
 					uploadedPartsCh <- uploadedPartRes{
@@ -279,13 +280,15 @@ func (c Client) putObjectMultipartStreamOptionalChecksum(ctx context.Context, bu
 		}
 
 		if opts.SendContentMd5 {
-			length, rerr := io.ReadFull(reader, buf)
+			length, rerr := readFull(reader, buf)
 			if rerr == io.EOF && partNumber > 1 {
 				break
 			}
-			if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+
+			if rerr != nil && rerr != io.ErrUnexpectedEOF && err != io.EOF {
 				return UploadInfo{}, rerr
 			}
+
 			// Calculate md5sum.
 			hash := c.md5Hasher()
 			hash.Write(buf[:length])
@@ -389,8 +392,8 @@ func (c Client) putObject(ctx context.Context, bucketName, objectName string, re
 		// Create a buffer.
 		buf := make([]byte, size)
 
-		length, rErr := io.ReadFull(reader, buf)
-		if rErr != nil && rErr != io.ErrUnexpectedEOF {
+		length, rErr := readFull(reader, buf)
+		if rErr != nil && rErr != io.ErrUnexpectedEOF && rErr != io.EOF {
 			return UploadInfo{}, rErr
 		}
 
@@ -434,14 +437,15 @@ func (c Client) putObjectDo(ctx context.Context, bucketName, objectName string, 
 		contentMD5Base64: md5Base64,
 		contentSHA256Hex: sha256Hex,
 	}
-	if opts.ReplicationVersionID != "" {
-		if _, err := uuid.Parse(opts.ReplicationVersionID); err != nil {
+	if opts.Internal.SourceVersionID != "" {
+		if _, err := uuid.Parse(opts.Internal.SourceVersionID); err != nil {
 			return UploadInfo{}, errInvalidArgument(err.Error())
 		}
 		urlValues := make(url.Values)
-		urlValues.Set("versionId", opts.ReplicationVersionID)
+		urlValues.Set("versionId", opts.Internal.SourceVersionID)
 		reqMetadata.queryValues = urlValues
 	}
+
 	// Execute PUT an objectName.
 	resp, err := c.executeMethod(ctx, http.MethodPut, reqMetadata)
 	defer closeResponse(resp)

@@ -14,11 +14,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/weaveworks/common/httpgrpc"
-	"github.com/weaveworks/common/user"
 
 	"github.com/cortexproject/cortex/pkg/frontend/v1/frontendv1pb"
+	"github.com/cortexproject/cortex/pkg/querier/stats"
 	"github.com/cortexproject/cortex/pkg/scheduler/queue"
+	"github.com/cortexproject/cortex/pkg/tenant"
+	"github.com/cortexproject/cortex/pkg/util"
 	"github.com/cortexproject/cortex/pkg/util/grpcutil"
+	"github.com/cortexproject/cortex/pkg/util/services"
+	"github.com/cortexproject/cortex/pkg/util/validation"
 )
 
 var (
@@ -43,13 +47,17 @@ type Limits interface {
 // Frontend queues HTTP requests, dispatches them to backends, and handles retries
 // for requests which failed.
 type Frontend struct {
+	services.Service
+
 	cfg    Config
 	log    log.Logger
 	limits Limits
 
 	requestQueue *queue.RequestQueue
+	activeUsers  *util.ActiveUsersCleanupService
 
 	// Metrics.
+	queueLength   *prometheus.GaugeVec
 	numClients    prometheus.GaugeFunc
 	queueDuration prometheus.Histogram
 }
@@ -64,18 +72,17 @@ type request struct {
 	response chan *httpgrpc.HTTPResponse
 }
 
-// New creates a new frontend.
-func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer) (*Frontend, error) {
-	queueLength := promauto.With(registerer).NewGaugeVec(prometheus.GaugeOpts{
-		Name: "cortex_query_frontend_queue_length",
-		Help: "Number of queries in the queue.",
-	}, []string{"user"})
+// New creates a new frontend. Frontend implements service, and must be started and stopped.
+func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer) *Frontend {
 
 	f := &Frontend{
-		cfg:          cfg,
-		log:          log,
-		limits:       limits,
-		requestQueue: queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, queueLength),
+		cfg:    cfg,
+		log:    log,
+		limits: limits,
+		queueLength: promauto.With(registerer).NewGaugeVec(prometheus.GaugeOpts{
+			Name: "cortex_query_frontend_queue_length",
+			Help: "Number of queries in the queue.",
+		}, []string{"user"}),
 		queueDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
 			Name:    "cortex_query_frontend_queue_duration_seconds",
 			Help:    "Time spend by requests queued.",
@@ -83,17 +90,30 @@ func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Regist
 		}),
 	}
 
+	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, f.queueLength)
+	f.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
+
 	f.numClients = promauto.With(registerer).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "cortex_query_frontend_connected_clients",
 		Help: "Number of worker clients currently connected to the frontend.",
 	}, f.requestQueue.GetConnectedQuerierWorkersMetric)
 
-	return f, nil
+	f.Service = services.NewIdleService(f.starting, f.stopping)
+	return f
 }
 
-// Close stops new requests and errors out any pending requests.
-func (f *Frontend) Close() {
+func (f *Frontend) starting(ctx context.Context) error {
+	return services.StartAndAwaitRunning(ctx, f.activeUsers)
+}
+
+func (f *Frontend) stopping(_ error) error {
+	// Stops new requests and errors out any pending requests.
 	f.requestQueue.Stop()
+	return services.StopAndAwaitTerminated(context.Background(), f.activeUsers)
+}
+
+func (f *Frontend) cleanupInactiveUserMetrics(user string) {
+	f.queueLength.DeleteLabelValues(user)
 }
 
 // RoundTripGRPC round trips a proto (instead of a HTTP request).
@@ -185,12 +205,13 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 
 		// Handle the stream sending & receiving on a goroutine so we can
 		// monitoring the contexts in a select and cancel things appropriately.
-		resps := make(chan *httpgrpc.HTTPResponse, 1)
+		resps := make(chan *frontendv1pb.ClientToFrontend, 1)
 		errs := make(chan error, 1)
 		go func() {
 			err = server.Send(&frontendv1pb.FrontendToClient{
-				Type:        frontendv1pb.HTTP_REQUEST,
-				HttpRequest: req.request,
+				Type:         frontendv1pb.HTTP_REQUEST,
+				HttpRequest:  req.request,
+				StatsEnabled: stats.IsEnabled(req.originalCtx),
 			})
 			if err != nil {
 				errs <- err
@@ -203,7 +224,7 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 				return
 			}
 
-			resps <- resp.HttpResponse
+			resps <- resp
 		}()
 
 		select {
@@ -219,9 +240,14 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 			req.err <- err
 			return err
 
-		// Happy path: propagate the response.
+		// Happy path: merge the stats and propagate the response.
 		case resp := <-resps:
-			req.response <- resp
+			if stats.ShouldTrackHTTPGRPCResponse(resp.HttpResponse) {
+				stats := stats.FromContext(req.originalCtx)
+				stats.Merge(resp.Stats) // Safe if stats is nil.
+			}
+
+			req.response <- resp.HttpResponse
 		}
 	}
 }
@@ -250,17 +276,22 @@ func getQuerierID(server frontendv1pb.Frontend_ProcessServer) (string, error) {
 }
 
 func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
-	userID, err := user.ExtractOrgID(ctx)
+	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
 		return err
 	}
 
-	req.enqueueTime = time.Now()
+	now := time.Now()
+	req.enqueueTime = now
 	req.queueSpan, _ = opentracing.StartSpanFromContext(ctx, "queued")
 
-	maxQueriers := f.limits.MaxQueriersPerUser(userID)
+	// aggregate the max queriers limit in the case of a multi tenant query
+	maxQueriers := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, f.limits.MaxQueriersPerUser)
 
-	err = f.requestQueue.EnqueueRequest(userID, req, maxQueriers, nil)
+	joinedTenantID := tenant.JoinTenantIDs(tenantIDs)
+	f.activeUsers.UpdateUserTimestamp(joinedTenantID, now)
+
+	err = f.requestQueue.EnqueueRequest(joinedTenantID, req, maxQueriers, nil)
 	if err == queue.ErrTooManyRequests {
 		return errTooManyRequest
 	}
