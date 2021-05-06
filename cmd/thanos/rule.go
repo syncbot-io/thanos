@@ -119,8 +119,11 @@ func registerRule(app *extkingpin.App) {
 	httpMethod := cmd.Flag("query.http-method", "HTTP method to use when sending queries. Possible options: [GET, POST]").
 		Default("POST").Enum("GET", "POST")
 
+	// The native Go resolver fails to parse compressed responses for SRV records.
+	// The miekgdns resolver doesn't suffer the same issue hence defaulting to it instead.
+	// See https://bugzilla.redhat.com/show_bug.cgi?id=1953518
 	dnsSDResolver := cmd.Flag("query.sd-dns-resolver", "Resolver to use. Possible options: [golang, miekgdns]").
-		Default("golang").Hidden().String()
+		Default("miekgdns").Hidden().String()
 
 	allowOutOfOrderUpload := cmd.Flag("shipper.allow-out-of-order-uploads",
 		"If true, shipper will skip failed block uploads in the given iteration and retry later. This means that some newer blocks might be uploaded sooner than older blocks."+
