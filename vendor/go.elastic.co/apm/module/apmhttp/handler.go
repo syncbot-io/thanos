@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package apmhttp
+package apmhttp // import "go.elastic.co/apm/module/apmhttp"
 
 import (
 	"context"
+	"io"
 	"net/http"
 
 	"go.elastic.co/apm"
@@ -38,13 +39,15 @@ func Wrap(h http.Handler, o ...ServerOption) http.Handler {
 		panic("h == nil")
 	}
 	handler := &handler{
-		handler:        h,
-		tracer:         apm.DefaultTracer,
-		requestName:    ServerRequestName,
-		requestIgnorer: DefaultServerRequestIgnorer(),
+		handler:     h,
+		tracer:      apm.DefaultTracer,
+		requestName: ServerRequestName,
 	}
 	for _, o := range o {
 		o(handler)
+	}
+	if handler.requestIgnorer == nil {
+		handler.requestIgnorer = NewDynamicServerRequestIgnorer(handler.tracer)
 	}
 	if handler.recovery == nil {
 		handler.recovery = NewTraceRecovery(handler.tracer)
@@ -56,17 +59,18 @@ func Wrap(h http.Handler, o ...ServerOption) http.Handler {
 //
 // The http.Request's context will be updated with the transaction.
 type handler struct {
-	handler        http.Handler
-	tracer         *apm.Tracer
-	recovery       RecoveryFunc
-	requestName    RequestNameFunc
-	requestIgnorer RequestIgnorerFunc
+	handler          http.Handler
+	tracer           *apm.Tracer
+	recovery         RecoveryFunc
+	panicPropagation bool
+	requestName      RequestNameFunc
+	requestIgnorer   RequestIgnorerFunc
 }
 
 // ServeHTTP delegates to h.Handler, tracing the transaction with
 // h.Tracer, or apm.DefaultTracer if h.Tracer is nil.
 func (h *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	if !h.tracer.Active() || h.requestIgnorer(req) {
+	if !h.tracer.Recording() || h.requestIgnorer(req) {
 		h.handler.ServeHTTP(w, req)
 		return
 	}
@@ -77,7 +81,14 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	w, resp := WrapResponseWriter(w)
 	defer func() {
 		if v := recover(); v != nil {
-			if resp.StatusCode == 0 {
+			if h.panicPropagation {
+				defer panic(v)
+				// 500 status code will be set only for APM transaction
+				// to allow other middleware to choose a different response code
+				if resp.StatusCode == 0 {
+					resp.StatusCode = http.StatusInternalServerError
+				}
+			} else if resp.StatusCode == 0 {
 				w.WriteHeader(http.StatusInternalServerError)
 			}
 			h.recovery(w, req, resp, body, tx, v)
@@ -97,16 +108,26 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 // If the transaction is not ignored, the request will be
 // returned with the transaction added to its context.
 func StartTransaction(tracer *apm.Tracer, name string, req *http.Request) (*apm.Transaction, *http.Request) {
-	var opts apm.TransactionOptions
-	if values := req.Header[TraceparentHeader]; len(values) == 1 && values[0] != "" {
-		if c, err := ParseTraceparentHeader(values[0]); err == nil {
-			opts.TraceContext = c
-		}
+	traceContext, ok := getRequestTraceparent(req, ElasticTraceparentHeader)
+	if !ok {
+		traceContext, ok = getRequestTraceparent(req, W3CTraceparentHeader)
 	}
-	tx := tracer.StartTransactionOptions(name, "request", opts)
+	if ok {
+		traceContext.State, _ = ParseTracestateHeader(req.Header[TracestateHeader]...)
+	}
+	tx := tracer.StartTransactionOptions(name, "request", apm.TransactionOptions{TraceContext: traceContext})
 	ctx := apm.ContextWithTransaction(req.Context(), tx)
 	req = RequestWithContext(ctx, req)
 	return tx, req
+}
+
+func getRequestTraceparent(req *http.Request, header string) (apm.TraceContext, bool) {
+	if values := req.Header[header]; len(values) == 1 && values[0] != "" {
+		if c, err := ParseTraceparentHeader(values[0]); err == nil {
+			return c, true
+		}
+	}
+	return apm.TraceContext{}, false
 }
 
 // SetTransactionContext sets tx.Result and, if the transaction is being
@@ -135,8 +156,8 @@ func SetContext(ctx *apm.Context, req *http.Request, resp *Response, body *apm.B
 // ResponseWriter's Write or WriteHeader methods are called, then the
 // response's StatusCode field will be zero.
 //
-// The returned http.ResponseWriter implements http.Pusher and http.Hijacker
-// if and only if the provided http.ResponseWriter does.
+// The returned http.ResponseWriter implements http.Pusher, http.Hijacker,
+// and io.ReaderFrom if and only if the provided http.ResponseWriter does.
 func WrapResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *Response) {
 	rw := responseWriter{
 		ResponseWriter: w,
@@ -144,30 +165,50 @@ func WrapResponseWriter(w http.ResponseWriter) (http.ResponseWriter, *Response) 
 			Headers: w.Header(),
 		},
 	}
+
 	h, _ := w.(http.Hijacker)
 	p, _ := w.(http.Pusher)
+	rf, _ := w.(io.ReaderFrom)
+
 	switch {
 	case h != nil && p != nil:
-		rwhp := &responseWriterHijackerPusher{
+		rwhp := responseWriterHijackerPusher{
 			responseWriter: rw,
 			Hijacker:       h,
 			Pusher:         p,
 		}
-		return rwhp, &rwhp.resp
+		if rf != nil {
+			rwhprf := responseWriterHijackerPusherReaderFrom{rwhp, rf}
+			return &rwhprf, &rwhprf.resp
+		}
+		return &rwhp, &rwhp.resp
 	case h != nil:
-		rwh := &responseWriterHijacker{
+		rwh := responseWriterHijacker{
 			responseWriter: rw,
 			Hijacker:       h,
 		}
-		return rwh, &rwh.resp
+		if rf != nil {
+			rwhrf := responseWriterHijackerReaderFrom{rwh, rf}
+			return &rwhrf, &rwhrf.resp
+		}
+		return &rwh, &rwh.resp
 	case p != nil:
-		rwp := &responseWriterPusher{
+		rwp := responseWriterPusher{
 			responseWriter: rw,
 			Pusher:         p,
 		}
-		return rwp, &rwp.resp
+		if rf != nil {
+			rwprf := responseWriterPusherReaderFrom{rwp, rf}
+			return &rwprf, &rwprf.resp
+		}
+		return &rwp, &rwp.resp
+	default:
+		if rf != nil {
+			rwrf := responseWriterReaderFrom{rw, rf}
+			return &rwrf, &rwrf.resp
+		}
+		return &rw, &rw.resp
 	}
-	return &rw, &rw.resp
 }
 
 // Response records details of the HTTP response.
@@ -211,7 +252,7 @@ func (w *responseWriter) CloseNotify() <-chan bool {
 	return nil
 }
 
-// Flush calls w.flush() if w.flush is non-nil, otherwise
+// Flush calls w.ResponseWriter's Flush method if implemented, otherwise
 // it does nothing.
 func (w *responseWriter) Flush() {
 	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
@@ -219,9 +260,19 @@ func (w *responseWriter) Flush() {
 	}
 }
 
+type responseWriterReaderFrom struct {
+	responseWriter
+	io.ReaderFrom
+}
+
 type responseWriterHijacker struct {
 	responseWriter
 	http.Hijacker
+}
+
+type responseWriterHijackerReaderFrom struct {
+	responseWriterHijacker
+	io.ReaderFrom
 }
 
 type responseWriterPusher struct {
@@ -229,10 +280,20 @@ type responseWriterPusher struct {
 	http.Pusher
 }
 
+type responseWriterPusherReaderFrom struct {
+	responseWriterPusher
+	io.ReaderFrom
+}
+
 type responseWriterHijackerPusher struct {
 	responseWriter
 	http.Hijacker
 	http.Pusher
+}
+
+type responseWriterHijackerPusherReaderFrom struct {
+	responseWriterHijackerPusher
+	io.ReaderFrom
 }
 
 // ServerOption sets options for tracing server requests.
@@ -257,6 +318,15 @@ func WithRecovery(r RecoveryFunc) ServerOption {
 	}
 	return func(h *handler) {
 		h.recovery = r
+	}
+}
+
+// WithPanicPropagation returns a ServerOption which enable panic propagation.
+// Any panic will be recovered and recorded as an error in a transaction, then
+// panic will be caused again.
+func WithPanicPropagation() ServerOption {
+	return func(h *handler) {
+		h.panicPropagation = true
 	}
 }
 

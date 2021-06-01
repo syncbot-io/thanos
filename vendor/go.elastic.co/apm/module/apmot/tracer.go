@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package apmot
+package apmot // import "go.elastic.co/apm/module/apmot"
 
 import (
 	"io"
@@ -34,8 +34,14 @@ import (
 //
 // By default, the returned tracer will use apm.DefaultTracer.
 // This can be overridden by using a WithTracer option.
+// The option WithSpanRefValidator allows one to override the
+// set of spans that are recorded. By default only child-of
+// spans are recorded.
 func New(opts ...Option) opentracing.Tracer {
-	t := &otTracer{tracer: apm.DefaultTracer}
+	t := &otTracer{
+		tracer:         apm.DefaultTracer,
+		isValidSpanRef: isChildOfSpanRef,
+	}
 	for _, opt := range opts {
 		opt(t)
 	}
@@ -44,7 +50,8 @@ func New(opts ...Option) opentracing.Tracer {
 
 // otTracer is an opentracing.Tracer backed by an apm.Tracer.
 type otTracer struct {
-	tracer *apm.Tracer
+	tracer         *apm.Tracer
+	isValidSpanRef SpanRefValidator
 }
 
 // StartSpan starts a new OpenTracing span with the given name and zero or more options.
@@ -73,7 +80,7 @@ func (t *otTracer) StartSpanWithOptions(name string, opts opentracing.StartSpanO
 	}
 
 	var parentTraceContext apm.TraceContext
-	if parentCtx, ok := parentSpanContext(opts.References); ok {
+	if parentCtx, ok := t.parentSpanContext(opts.References); ok {
 		if parentCtx.tx != nil && (parentCtx.tracer == t || parentCtx.tracer == nil) {
 			opts := apm.SpanOptions{
 				Parent: parentCtx.traceContext, // parent span
@@ -108,7 +115,13 @@ func (t *otTracer) Inject(sc opentracing.SpanContext, format interface{}, carrie
 			return opentracing.ErrInvalidCarrier
 		}
 		headerValue := apmhttp.FormatTraceparentHeader(spanContext.traceContext)
-		writer.Set(apmhttp.TraceparentHeader, headerValue)
+		writer.Set(apmhttp.W3CTraceparentHeader, headerValue)
+		if t.tracer.ShouldPropagateLegacyHeader() {
+			writer.Set(apmhttp.ElasticTraceparentHeader, headerValue)
+		}
+		if tracestate := spanContext.traceContext.State.String(); tracestate != "" {
+			writer.Set(apmhttp.TracestateHeader, tracestate)
+		}
 		return nil
 	case opentracing.Binary:
 		writer, ok := carrier.(io.Writer)
@@ -124,28 +137,43 @@ func (t *otTracer) Inject(sc opentracing.SpanContext, format interface{}, carrie
 func (t *otTracer) Extract(format interface{}, carrier interface{}) (opentracing.SpanContext, error) {
 	switch format {
 	case opentracing.TextMap, opentracing.HTTPHeaders:
-		var headerValue string
+		var traceparentHeaderValue string
+		var tracestateHeaderValues []string
 		switch carrier := carrier.(type) {
 		case opentracing.HTTPHeadersCarrier:
-			headerValue = http.Header(carrier).Get(apmhttp.TraceparentHeader)
+			traceparentHeaderValue = http.Header(carrier).Get(apmhttp.ElasticTraceparentHeader)
+			if traceparentHeaderValue == "" {
+				traceparentHeaderValue = http.Header(carrier).Get(apmhttp.W3CTraceparentHeader)
+			}
+			tracestateHeaderValues = http.Header(carrier)[apmhttp.TracestateHeader]
 		case opentracing.TextMapReader:
 			carrier.ForeachKey(func(key, val string) error {
-				if textproto.CanonicalMIMEHeaderKey(key) == apmhttp.TraceparentHeader {
-					headerValue = val
-					return io.EOF // arbitrary error to break loop
+				switch textproto.CanonicalMIMEHeaderKey(key) {
+				case apmhttp.ElasticTraceparentHeader:
+					traceparentHeaderValue = val
+				case apmhttp.W3CTraceparentHeader:
+					// The Elastic header value always trumps the W3C one,
+					// to ensure backwards compatibility, hence we only set
+					// the value if not set already.
+					if traceparentHeaderValue == "" {
+						traceparentHeaderValue = val
+					}
+				case apmhttp.TracestateHeader:
+					tracestateHeaderValues = append(tracestateHeaderValues, val)
 				}
 				return nil
 			})
 		default:
 			return nil, opentracing.ErrInvalidCarrier
 		}
-		if headerValue == "" {
+		if traceparentHeaderValue == "" {
 			return nil, opentracing.ErrSpanContextNotFound
 		}
-		traceContext, err := apmhttp.ParseTraceparentHeader(headerValue)
+		traceContext, err := apmhttp.ParseTraceparentHeader(traceparentHeaderValue)
 		if err != nil {
 			return nil, err
 		}
+		traceContext.State, _ = apmhttp.ParseTracestateHeader(tracestateHeaderValues...)
 		return &spanContext{tracer: t, traceContext: traceContext}, nil
 	case opentracing.Binary:
 		reader, ok := carrier.(io.Reader)
@@ -173,6 +201,20 @@ func WithTracer(t *apm.Tracer) Option {
 	}
 	return func(o *otTracer) {
 		o.tracer = t
+	}
+}
+
+// SpanRefValidator verifies if a span is valid and should be recorded.
+type SpanRefValidator func(ref opentracing.SpanReference) bool
+
+// WithSpanRefValidator returns an Option which sets the span validation
+// function. By default only child-of span are considered valid.
+func WithSpanRefValidator(validator SpanRefValidator) Option {
+	if validator == nil {
+		panic("validator == nil")
+	}
+	return func(o *otTracer) {
+		o.isValidSpanRef = validator
 	}
 }
 

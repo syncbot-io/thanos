@@ -3,7 +3,7 @@
 @Library('apm@current') _
 
 pipeline {
-  agent any
+  agent { label 'linux && immutable' }
   environment {
     REPO = 'apm-agent-go'
     BASE_DIR = "src/go.elastic.co/apm"
@@ -11,9 +11,12 @@ pipeline {
     JOB_GCS_BUCKET = credentials('gcs-bucket')
     CODECOV_SECRET = 'secret/apm-team/ci/apm-agent-go-codecov'
     GO111MODULE = 'on'
+    GOPATH = "${env.WORKSPACE}"
     GOPROXY = 'https://proxy.golang.org'
+    HOME = "${env.WORKSPACE}"
     GITHUB_CHECK_ITS_NAME = 'Integration Tests'
     ITS_PIPELINE = 'apm-integration-tests-selector-mbp/master'
+    OPBEANS_REPO = 'opbeans-go'
   }
   options {
     timeout(time: 1, unit: 'HOURS')
@@ -26,10 +29,10 @@ pipeline {
     quietPeriod(10)
   }
   triggers {
-    issueCommentTrigger('(?i).*(?:jenkins\\W+)?run\\W+(?:the\\W+)?tests(?:\\W+please)?.*')
+    issueCommentTrigger('(?i).*(?:jenkins\\W+)?run\\W+(?:the\\W+)?(?:benchmark\\W+)?tests(?:\\W+please)?.*')
   }
   parameters {
-    string(name: 'GO_VERSION', defaultValue: "1.12.7", description: "Go version to use.")
+    string(name: 'GO_VERSION', defaultValue: "1.14.2", description: "Go version to use.")
     booleanParam(name: 'Run_As_Master_Branch', defaultValue: false, description: 'Allow to run any steps on a PR, some steps normally only run on master branch.')
     booleanParam(name: 'test_ci', defaultValue: true, description: 'Enable test')
     booleanParam(name: 'docker_test_ci', defaultValue: true, description: 'Enable run docker tests')
@@ -37,11 +40,8 @@ pipeline {
   }
   stages {
     stage('Initializing'){
-      agent { label 'linux && immutable' }
       options { skipDefaultCheckout() }
       environment {
-        HOME = "${env.WORKSPACE}"
-        GOPATH = "${env.WORKSPACE}"
         GO_VERSION = "${params.GO_VERSION}"
         PATH = "${env.PATH}:${env.WORKSPACE}/bin"
       }
@@ -50,20 +50,31 @@ pipeline {
          Checkout the code and stash it, to use it on other stages.
         */
         stage('Checkout') {
+          options { skipDefaultCheckout() }
           steps {
-            gitCheckout(basedir: "${BASE_DIR}", githubNotifyFirstTimeContributor: true)
+            pipelineManager([ cancelPreviousRunningBuilds: [ when: 'PR' ] ])
+            deleteDir()
+            gitCheckout(basedir: "${BASE_DIR}", githubNotifyFirstTimeContributor: true, reference: '/var/lib/jenkins/.git-references/apm-agent-go.git')
             stash allowEmpty: true, name: 'source', useDefaultExcludes: false
+            script {
+              dir("${BASE_DIR}"){
+                // Skip all the stages except docs for PR's with asciidoc and md changes only
+                env.ONLY_DOCS = isGitRegionMatch(patterns: [ '.*\\.(asciidoc|md)' ], shouldMatchAll: true)
+              }
+            }
           }
         }
         /**
         Execute unit tests.
         */
         stage('Tests') {
-          agent { label 'linux && immutable' }
           options { skipDefaultCheckout() }
           when {
             beforeAgent true
-            expression { return params.test_ci }
+            allOf {
+              expression { return env.ONLY_DOCS == "false" }
+              expression { return params.test_ci }
+            }
           }
           steps {
             withGithubNotify(context: 'Tests', tab: 'tests') {
@@ -88,11 +99,13 @@ pipeline {
           }
         }
         stage('Coverage') {
-          agent { label 'linux && immutable' }
           options { skipDefaultCheckout() }
           when {
             beforeAgent true
-            expression { return params.docker_test_ci }
+            allOf {
+              expression { return env.ONLY_DOCS == "false" }
+              expression { return params.docker_test_ci }
+            }
           }
           steps {
             withGithubNotify(context: 'Coverage') {
@@ -124,10 +137,9 @@ pipeline {
             allOf {
               anyOf {
                 branch 'master'
-                branch "\\d+\\.\\d+"
-                branch "v\\d?"
-                tag "v\\d+\\.\\d+\\.\\d+*"
+                tag pattern: 'v\\d+\\.\\d+\\.\\d+.*', comparator: 'REGEXP'
                 expression { return params.Run_As_Master_Branch }
+                expression { return env.GITHUB_COMMENT?.contains('benchmark tests') }
               }
               expression { return params.bench_ci }
             }
@@ -146,44 +158,70 @@ pipeline {
         }
       }
     }
-    stage('Windows') {
-      agent { label 'windows' }
-      options { skipDefaultCheckout() }
-      environment {
-        GOROOT = "c:\\Go"
-        GOPATH = "${env.WORKSPACE}"
-        PATH = "${env.PATH};${env.GOROOT}\\bin;${env.GOPATH}\\bin"
-        GO_VERSION = "${params.GO_VERSION}"
-      }
-      steps {
-        withGithubNotify(context: 'Build-Test - Windows') {
-          cleanDir("${WORKSPACE}/${BASE_DIR}")
-          unstash 'source'
-          dir("${BASE_DIR}"){
-            bat script: 'scripts/jenkins/windows/install-tools.bat', label: 'Install tools'
-            bat script: 'scripts/jenkins/windows/build-test.bat', label: 'Build and test'
-          }
-        }
-      }
-      post {
-        always {
-          junit(allowEmptyResults: true, keepLongStdio: true, testResults: "${BASE_DIR}/build/junit-*.xml")
-          dir("${BASE_DIR}"){
-            bat script: 'scripts/jenkins/windows/uninstall-tools.bat', label: 'Uninstall tools'
-          }
-          cleanWs(disableDeferredWipeout: true, notFailBuild: true)
-        }
-      }
-    }
-    stage('OSX') {
-      agent none
-      /** TODO: As soon as MacOSX are available we will provide the stage implementation */
+    stage('More OS') {
       when {
         beforeAgent true
-        expression { return false }
+        expression { return env.ONLY_DOCS == "false" }
       }
-      steps {
-        echo 'TBD'
+      parallel {
+        stage('Windows') {
+          agent { label 'windows-2019-immutable' }
+          options { skipDefaultCheckout() }
+          environment {
+            GOROOT = "c:\\Go"
+            GOPATH = "${env.WORKSPACE}"
+            PATH = "${env.PATH};${env.GOROOT}\\bin;${env.GOPATH}\\bin"
+            GO_VERSION = "${params.GO_VERSION}"
+          }
+          steps {
+            withGithubNotify(context: 'Build-Test - Windows') {
+              cleanDir("${WORKSPACE}/${BASE_DIR}")
+              unstash 'source'
+              dir("${BASE_DIR}"){
+                bat script: 'scripts/jenkins/windows/install-tools.bat', label: 'Install tools'
+                bat script: 'scripts/jenkins/windows/build-test.bat', label: 'Build and test'
+              }
+            }
+          }
+          post {
+            always {
+              junit(allowEmptyResults: true, keepLongStdio: true, testResults: "${BASE_DIR}/build/junit-*.xml")
+            }
+          }
+        }
+        stage('OSX') {
+          agent { label 'macosx' }
+          options { skipDefaultCheckout() }
+          environment {
+            GO_VERSION = "${params.GO_VERSION}"
+            PATH = "${env.PATH}:${env.WORKSPACE}/bin"
+          }
+          steps {
+            withGithubNotify(context: 'Build-Test - OSX') {
+              retry(3) {
+                deleteDir()
+                unstash 'source'
+                dir("${BASE_DIR}"){
+                  sh script: './scripts/jenkins/before_install.sh', label: 'Install dependencies'
+                }
+              }
+              retry(3) {
+                dir("${BASE_DIR}"){
+                  sh script: './scripts/jenkins/build.sh', label: 'Build'
+                }
+              }
+              dir("${BASE_DIR}"){
+                sh script: './scripts/jenkins/test.sh', label: 'Test'
+              }
+            }
+          }
+          post {
+            always {
+              junit(allowEmptyResults: true, keepLongStdio: true, testResults: "${BASE_DIR}/build/junit-*.xml")
+              deleteDir()
+            }
+          }
+        }
       }
     }
     stage('Integration Tests') {
@@ -191,21 +229,48 @@ pipeline {
       when {
         beforeAgent true
         allOf {
+          expression { return env.ONLY_DOCS == "false" }
           anyOf {
-            environment name: 'GIT_BUILD_CAUSE', value: 'pr'
+            changeRequest()
             expression { return !params.Run_As_Master_Branch }
           }
         }
       }
       steps {
-        log(level: 'INFO', text: 'Launching Async ITs')
         build(job: env.ITS_PIPELINE, propagate: false, wait: false,
-              parameters: [string(name: 'AGENT_INTEGRATION_TEST', value: 'Go'),
-                           string(name: 'BUILD_OPTS', value: "--go-agent-version ${env.GIT_BASE_COMMIT}"),
+              parameters: [string(name: 'INTEGRATION_TEST', value: 'Go'),
+                           string(name: 'BUILD_OPTS', value: "--go-agent-version ${env.GIT_BASE_COMMIT} --opbeans-go-agent-branch ${env.GIT_BASE_COMMIT}"),
                            string(name: 'GITHUB_CHECK_NAME', value: env.GITHUB_CHECK_ITS_NAME),
                            string(name: 'GITHUB_CHECK_REPO', value: env.REPO),
                            string(name: 'GITHUB_CHECK_SHA1', value: env.GIT_BASE_COMMIT)])
         githubNotify(context: "${env.GITHUB_CHECK_ITS_NAME}", description: "${env.GITHUB_CHECK_ITS_NAME} ...", status: 'PENDING', targetUrl: "${env.JENKINS_URL}search/?q=${env.ITS_PIPELINE.replaceAll('/','+')}")
+      }
+    }
+    stage('Release') {
+      options { skipDefaultCheckout() }
+      when {
+        beforeAgent true
+        tag pattern: 'v\\d+\\.\\d+\\.\\d+', comparator: 'REGEXP'
+      }
+      stages {
+        stage('Opbeans') {
+          environment {
+            REPO_NAME = "${OPBEANS_REPO}"
+            GO_VERSION = "${params.GO_VERSION}"
+          }
+          steps {
+            deleteDir()
+            dir("${OPBEANS_REPO}"){
+              git credentialsId: 'f6c7695a-671e-4f4f-a331-acdce44ff9ba',
+                  url: "git@github.com:elastic/${OPBEANS_REPO}.git"
+              sh script: ".ci/bump-version.sh ${env.BRANCH_NAME}", label: 'Bump version'
+              // The opbeans-go pipeline will trigger a release for the master branch
+              gitPush()
+              // The opbeans-go pipeline will trigger a release for the release tag
+              gitCreateTag(tag: "${env.BRANCH_NAME}")
+            }
+          }
+        }
       }
     }
   }
@@ -218,17 +283,26 @@ pipeline {
 
 def generateStep(version){
   return {
-    node('docker && linux && immutable'){
+    node('linux && immutable'){
       try {
-        deleteDir()
-        unstash 'source'
         echo "${version}"
-        dir("${BASE_DIR}"){
-          withEnv([
-            "GO_VERSION=${version}",
-            "HOME=${WORKSPACE}"]) {
-            sh script: './scripts/jenkins/before_install.sh', label: 'Install dependencies'
-            sh script: './scripts/jenkins/build-test.sh', label: 'Build and test'
+        withEnv(["GO_VERSION=${version}"]) {
+          // Another retry in case there are any environmental issues
+          // See https://issuetracker.google.com/issues/146072599 for more context
+          retry(3) {
+            deleteDir()
+            unstash 'source'
+            dir("${BASE_DIR}"){
+              sh script: './scripts/jenkins/before_install.sh', label: 'Install dependencies'
+            }
+          }
+          retry(3) {
+            dir("${BASE_DIR}"){
+              sh script: './scripts/jenkins/build.sh', label: 'Build'
+            }
+          }
+          dir("${BASE_DIR}"){
+            sh script: './scripts/jenkins/test.sh', label: 'Test'
           }
         }
       } catch(e){

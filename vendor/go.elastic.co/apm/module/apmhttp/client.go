@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package apmhttp
+package apmhttp // import "go.elastic.co/apm/module/apmhttp"
 
 import (
 	"io"
@@ -70,13 +70,12 @@ type roundTripper struct {
 	r              http.RoundTripper
 	requestName    RequestNameFunc
 	requestIgnorer RequestIgnorerFunc
+	traceRequests  bool
 }
 
 // RoundTrip delegates to r.r, emitting a span if req's context
 // contains a transaction.
 func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// TODO(axw) propagate Tracestate, adding/shifting the elastic
-	// key to the left most position.
 	if r.requestIgnorer(req) {
 		return r.r.RoundTrip(req)
 	}
@@ -95,17 +94,22 @@ func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	req = &reqCopy
 
+	propagateLegacyHeader := tx.ShouldPropagateLegacyHeader()
 	traceContext := tx.TraceContext()
 	if !traceContext.Options.Recorded() {
-		req.Header.Set(TraceparentHeader, FormatTraceparentHeader(traceContext))
+		r.setHeaders(req, traceContext, propagateLegacyHeader)
 		return r.r.RoundTrip(req)
 	}
 
 	name := r.requestName(req)
 	span := tx.StartSpan(name, "external.http", apm.SpanFromContext(ctx))
+	var rt *requestTracer
 	if !span.Dropped() {
 		traceContext = span.TraceContext()
 		ctx = apm.ContextWithSpan(ctx, span)
+		if r.traceRequests {
+			ctx, rt = withClientTrace(ctx, tx, span)
+		}
 		req = RequestWithContext(ctx, req)
 		span.Context.SetHTTPRequest(req)
 	} else {
@@ -113,17 +117,31 @@ func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		span = nil
 	}
 
-	req.Header.Set(TraceparentHeader, FormatTraceparentHeader(traceContext))
+	r.setHeaders(req, traceContext, propagateLegacyHeader)
 	resp, err := r.r.RoundTrip(req)
 	if span != nil {
 		if err != nil {
+			if rt != nil {
+				rt.end()
+			}
 			span.End()
 		} else {
 			span.Context.SetHTTPStatusCode(resp.StatusCode)
-			resp.Body = &responseBody{span: span, body: resp.Body}
+			resp.Body = &responseBody{span: span, body: resp.Body, requestTracer: rt}
 		}
 	}
 	return resp, err
+}
+
+func (r *roundTripper) setHeaders(req *http.Request, traceContext apm.TraceContext, propagateLegacyHeader bool) {
+	headerValue := FormatTraceparentHeader(traceContext)
+	if propagateLegacyHeader {
+		req.Header.Set(ElasticTraceparentHeader, headerValue)
+	}
+	req.Header.Set(W3CTraceparentHeader, headerValue)
+	if tracestate := traceContext.State.String(); tracestate != "" {
+		req.Header.Set(TracestateHeader, tracestate)
+	}
 }
 
 // CloseIdleConnections calls r.r.CloseIdleConnections if the method exists.
@@ -147,8 +165,9 @@ func (r *roundTripper) CancelRequest(req *http.Request) {
 }
 
 type responseBody struct {
-	span *apm.Span
-	body io.ReadCloser
+	span          *apm.Span
+	requestTracer *requestTracer
+	body          io.ReadCloser
 }
 
 // Close closes the response body, and ends the span if it hasn't already been ended.
@@ -170,9 +189,24 @@ func (b *responseBody) Read(p []byte) (n int, err error) {
 func (b *responseBody) endSpan() {
 	addr := (*unsafe.Pointer)(unsafe.Pointer(&b.span))
 	if old := atomic.SwapPointer(addr, nil); old != nil {
+		if b.requestTracer != nil {
+			b.requestTracer.end()
+		}
 		(*apm.Span)(old).End()
 	}
 }
 
 // ClientOption sets options for tracing client requests.
 type ClientOption func(*roundTripper)
+
+// WithClientRequestName returns a ClientOption which sets r as the function
+// to use to obtain the span name for the given http request.
+func WithClientRequestName(r RequestNameFunc) ClientOption {
+	if r == nil {
+		panic("r == nil")
+	}
+
+	return ClientOption(func(rt *roundTripper) {
+		rt.requestName = r
+	})
+}
