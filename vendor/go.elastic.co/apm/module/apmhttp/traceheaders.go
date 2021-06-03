@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-package apmhttp
+package apmhttp // import "go.elastic.co/apm/module/apmhttp"
 
 import (
 	"encoding/hex"
@@ -30,10 +30,23 @@ import (
 const (
 	// TraceparentHeader is the HTTP header for trace propagation.
 	//
-	// NOTE: at this time, the W3C Trace-Context headers are not finalised.
-	// To avoid producing possibly invalid traceparent headers, we will
-	// use an alternative name until the format is frozen.
-	TraceparentHeader = "Elastic-Apm-Traceparent"
+	// For backwards compatibility, this is currently an alias for
+	// for ElasticTraceparentHeader, but the more specific constants
+	// below should be preferred. In a future version this will be
+	// replaced by the standard W3C header.
+	TraceparentHeader = ElasticTraceparentHeader
+
+	// ElasticTraceparentHeader is the legacy HTTP header for trace propagation,
+	// maintained for backwards compatibility with older agents.
+	ElasticTraceparentHeader = "Elastic-Apm-Traceparent"
+
+	// W3CTraceparentHeader is the standard W3C Trace-Context HTTP
+	// header for trace propagation.
+	W3CTraceparentHeader = "Traceparent"
+
+	// TracestateHeader is the standard W3C Trace-Context HTTP header
+	// for vendor-specific trace propagation.
+	TracestateHeader = "Tracestate"
 )
 
 // FormatTraceparentHeader formats the given trace context as a
@@ -47,10 +60,13 @@ func FormatTraceparentHeader(c apm.TraceContext) string {
 // the W3C Trace-Context traceparent format according to W3C Editor's Draft 23 May 2018:
 //     https://w3c.github.io/trace-context/#traceparent-field
 //
-// Note that the returned TraceParent's Trace and Span fields are not necessarily
+// Note that the returned TraceContext's Trace and Span fields are not necessarily
 // valid. The caller must decide whether or not it wishes to disregard invalid
 // trace/span IDs, and validate them as required using their provided Validate
 // methods.
+//
+// The returned TraceContext's TraceState field will be the empty value. Use
+// ParseTracestateHeader to parse that separately.
 func ParseTraceparentHeader(h string) (apm.TraceContext, error) {
 	var out apm.TraceContext
 	if len(h) < 3 || h[2] != '-' {
@@ -114,4 +130,39 @@ func ParseTraceparentHeader(h string) (apm.TraceContext, error) {
 		out.Options = apm.TraceOptions(traceOptions[0])
 		return out, nil
 	}
+}
+
+// ParseTracestateHeader parses the given header, which is expected to be in the
+// W3C Trace-Context tracestate format according to W3C Editor's Draft 18 Nov 2019:
+//    https://w3c.github.io/trace-context/#tracestate-header
+//
+// Note that the returned TraceState is not necessarily valid. The caller must
+// decide whether or not it wishes to disregard invalid tracestate entries, and
+// validate them as required using their provided Validate methods.
+//
+// Multiple header values may be presented, in which case they will be treated as
+// if they are concatenated together with commas.
+func ParseTracestateHeader(h ...string) (apm.TraceState, error) {
+	var entries []apm.TraceStateEntry
+	for _, h := range h {
+		for {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				break
+			}
+			kv := h
+			if comma := strings.IndexRune(h, ','); comma != -1 {
+				kv = strings.TrimSpace(h[:comma])
+				h = h[comma+1:]
+			} else {
+				h = ""
+			}
+			equal := strings.IndexRune(kv, '=')
+			if equal == -1 {
+				return apm.TraceState{}, errors.New("missing '=' in tracestate entry")
+			}
+			entries = append(entries, apm.TraceStateEntry{Key: kv[:equal], Value: kv[equal+1:]})
+		}
+	}
+	return apm.NewTraceState(entries...), nil
 }
