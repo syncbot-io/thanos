@@ -23,6 +23,8 @@ import (
 )
 
 func TestTargetsAPI_Fanout(t *testing.T) {
+	t.Skip("TODO: Flaky test. See: https://github.com/thanos-io/thanos/issues/4069")
+
 	t.Parallel()
 
 	netName := "e2e_test_targets_fanout"
@@ -50,19 +52,10 @@ func TestTargetsAPI_Fanout(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2))
 
-	q, err := e2ethanos.NewQuerier(
-		s.SharedDir(),
-		"query",
-		[]string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint()},
-		nil,
-		nil,
-		[]string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint()},
-		nil,
-		nil,
-		"",
-		"",
-	)
-
+	stores := []string{sidecar1.GRPCNetworkEndpoint(), sidecar2.GRPCNetworkEndpoint()}
+	q, err := e2ethanos.NewQuerierBuilder(s.SharedDir(), "query", stores).
+		WithTargetAddresses(stores).
+		Build()
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
@@ -105,7 +98,8 @@ func TestTargetsAPI_Fanout(t *testing.T) {
 	})
 }
 
-func targetAndAssert(t *testing.T, ctx context.Context, addr string, state string, want *targetspb.TargetDiscovery) {
+//nolint:unused
+func targetAndAssert(t *testing.T, ctx context.Context, addr, state string, want *targetspb.TargetDiscovery) {
 	t.Helper()
 
 	fmt.Println("targetAndAssert: Waiting for results for targets state", state)
