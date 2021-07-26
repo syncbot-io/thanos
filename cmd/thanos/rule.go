@@ -27,6 +27,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/tsdb"
@@ -34,12 +35,12 @@ import (
 	"github.com/thanos-io/thanos/pkg/errutil"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 
+	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/thanos-io/thanos/pkg/alert"
 	v1 "github.com/thanos-io/thanos/pkg/api/rule"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/dns"
-	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	http_util "github.com/thanos-io/thanos/pkg/http"
@@ -69,16 +70,16 @@ type ruleConfig struct {
 	query           queryConfig
 	queryConfigYAML []byte
 
-	alertmgr            alertMgrConfig
-	alertmgrsConfigYAML []byte
-	alertQueryURL       *url.URL
+	alertmgr               alertMgrConfig
+	alertmgrsConfigYAML    []byte
+	alertQueryURL          *url.URL
+	alertRelabelConfigYAML []byte
 
 	resendDelay    time.Duration
 	evalInterval   time.Duration
 	ruleFiles      []string
 	objStoreConfig *extflag.PathOrContent
 	dataDir        string
-	reloadSignal   <-chan struct{}
 	lset           labels.Labels
 }
 
@@ -172,6 +173,11 @@ func registerRule(app *extkingpin.App) {
 			return errors.New("--alertmanagers.url and --alertmanagers.config* parameters cannot be defined at the same time")
 		}
 
+		conf.alertRelabelConfigYAML, err = conf.alertmgr.alertRelabelConfigPath.Content()
+		if err != nil {
+			return err
+		}
+
 		httpLogOpts, err := logging.ParseHTTPOptions(*reqLogDecision, reqLogConfig)
 		if err != nil {
 			return errors.Wrap(err, "error while parsing config for request logging")
@@ -188,6 +194,7 @@ func registerRule(app *extkingpin.App) {
 			tracer,
 			comp,
 			*conf,
+			reload,
 			getFlagsMap(cmd.Flags()),
 			httpLogOpts,
 			grpcLogOpts,
@@ -250,6 +257,7 @@ func runRule(
 	tracer opentracing.Tracer,
 	comp component.Component,
 	conf ruleConfig,
+	reloadSignal <-chan struct{},
 	flagsMap map[string]string,
 	httpLogOpts []logging.Option,
 	grpcLogOpts []grpc_logging.Option,
@@ -352,6 +360,14 @@ func runRule(
 		level.Warn(logger).Log("msg", "no alertmanager configured")
 	}
 
+	var alertRelabelConfigs []*relabel.Config
+	if len(conf.alertRelabelConfigYAML) > 0 {
+		alertRelabelConfigs, err = alert.LoadRelabelConfigs(conf.alertRelabelConfigYAML)
+		if err != nil {
+			return err
+		}
+	}
+
 	amProvider := dns.NewProvider(
 		logger,
 		extprom.WrapRegistererWithPrefix("thanos_rule_alertmanagers_", reg),
@@ -377,7 +393,7 @@ func runRule(
 
 	var (
 		ruleMgr *thanosrules.Manager
-		alertQ  = alert.NewQueue(logger, reg, 10000, 100, labelsTSDBToProm(conf.lset), conf.alertmgr.alertExcludeLabels)
+		alertQ  = alert.NewQueue(logger, reg, 10000, 100, labelsTSDBToProm(conf.lset), conf.alertmgr.alertExcludeLabels, alertRelabelConfigs)
 	)
 	{
 		// Run rule evaluation and alert notifications.
@@ -468,7 +484,7 @@ func runRule(
 			}
 			for {
 				select {
-				case <-conf.reloadSignal:
+				case <-reloadSignal:
 					if err := reloadRules(logger, conf.ruleFiles, ruleMgr, conf.evalInterval, metrics); err != nil {
 						level.Error(logger).Log("msg", "reload rules by sighup failed", "err", err)
 					}
@@ -558,6 +574,7 @@ func runRule(
 		srv := httpserver.New(logger, reg, comp, httpProbe,
 			httpserver.WithListen(conf.http.bindAddress),
 			httpserver.WithGracePeriod(time.Duration(conf.http.gracePeriod)),
+			httpserver.WithTLSConfig(conf.http.tlsConfig),
 		)
 		srv.Handle("/", router)
 
@@ -639,7 +656,7 @@ func parseFlagLabels(s []string) (labels.Labels, error) {
 		if len(parts) != 2 {
 			return nil, errors.Errorf("unrecognized label %q", l)
 		}
-		if !model.LabelName.IsValid(model.LabelName(string(parts[0]))) {
+		if !model.LabelName.IsValid(model.LabelName(parts[0])) {
 			return nil, errors.Errorf("unsupported format for label %s", l)
 		}
 		val, err := strconv.Unquote(parts[1])

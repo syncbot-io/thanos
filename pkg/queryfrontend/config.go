@@ -16,8 +16,8 @@ import (
 	"github.com/pkg/errors"
 	"gopkg.in/yaml.v2"
 
+	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/thanos-io/thanos/pkg/cacheutil"
-	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/model"
 )
 
@@ -206,7 +206,7 @@ func (cfg *Config) Validate() error {
 		return errors.New("labels.default-time-range cannot be set to 0")
 	}
 
-	if len(cfg.DownstreamURL) == 0 {
+	if cfg.DownstreamURL == "" {
 		return errors.New("downstream URL should be configured")
 	}
 

@@ -27,10 +27,14 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	prommodel "github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
+
+	extflag "github.com/efficientgo/tools/extkingpin"
 	v1 "github.com/thanos-io/thanos/pkg/api/blocks"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
@@ -38,7 +42,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/compactv2"
 	"github.com/thanos-io/thanos/pkg/component"
-	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extkingpin"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
@@ -83,6 +86,7 @@ func registerBucket(app extkingpin.AppClause) {
 	registerBucketCleanup(cmd, objStoreConfig)
 	registerBucketMarkBlock(cmd, objStoreConfig)
 	registerBucketRewrite(cmd, objStoreConfig)
+	registerBucketRetention(cmd, objStoreConfig)
 }
 
 func registerBucketVerify(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
@@ -321,8 +325,7 @@ func registerBucketInspect(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 // registerBucketWeb exposes a web interface for the state of remote store like `pprof web`.
 func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
 	cmd := app.Command("web", "Web interface for remote storage bucket.")
-	httpBindAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
-
+	httpBindAddr, httpGracePeriod, httpTLSConfig := extkingpin.RegisterHTTPFlags(cmd)
 	webRoutePrefix := cmd.Flag("web.route-prefix", "Prefix for API and UI endpoints. This allows thanos UI to be served on a sub-path. Defaults to the value of --web.external-prefix. This option is analogous to --web.route-prefix of Prometheus.").Default("").String()
 	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the bucket web UI interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos bucket web UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
 	webPrefixHeaderName := cmd.Flag("web.prefix-header", "Name of HTTP request header used for dynamic prefixing of UI links and redirects. This option is ignored if web.external-prefix argument is set. Security risk: enable this option only if a reverse proxy in front of thanos is resetting the header. The --web.prefix-header=X-Forwarded-Prefix option can be useful, for example, if Thanos UI is served via Traefik reverse proxy with PathPrefixStrip option enabled, which sends the stripped prefix value in X-Forwarded-Prefix header. This allows thanos UI to be served on a sub-path.").Default("").String()
@@ -343,6 +346,7 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 		srv := httpserver.New(logger, reg, comp, httpProbe,
 			httpserver.WithListen(*httpBindAddr),
 			httpserver.WithGracePeriod(time.Duration(*httpGracePeriod)),
+			httpserver.WithTLSConfig(*httpTLSConfig),
 		)
 
 		if *webRoutePrefix == "" {
@@ -430,10 +434,7 @@ func registerBucketWeb(app extkingpin.AppClause, objStoreConfig *extflag.PathOrC
 					defer iterCancel()
 
 					_, _, err := fetcher.Fetch(iterCtx)
-					if err != nil {
-						return err
-					}
-					return nil
+					return err
 				})
 			})
 		}, func(error) {
@@ -465,7 +466,7 @@ func listResLevel() []string {
 
 func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
 	cmd := app.Command("replicate", fmt.Sprintf("Replicate data from one object storage to another. NOTE: Currently it works only with Thanos blocks (%v has to have Thanos metadata).", block.MetaFilename))
-	httpBindAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
+	httpBindAddr, httpGracePeriod, httpTLSConfig := extkingpin.RegisterHTTPFlags(cmd)
 	toObjStoreConfig := extkingpin.RegisterCommonObjStoreFlags(cmd, "-to", false, "The object storage which replicate data to.")
 	resolutions := cmd.Flag("resolution", "Only blocks with these resolutions will be replicated. Repeated flag.").Default("0s", "5m", "1h").HintAction(listResLevel).DurationList()
 	compactions := cmd.Flag("compaction", "Only blocks with these compaction levels will be replicated. Repeated flag.").Default("1", "2", "3", "4").Ints()
@@ -503,6 +504,7 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 			reg,
 			tracer,
 			*httpBindAddr,
+			*httpTLSConfig,
 			time.Duration(*httpGracePeriod),
 			matchers,
 			resolutionLevels,
@@ -519,14 +521,16 @@ func registerBucketReplicate(app extkingpin.AppClause, objStoreConfig *extflag.P
 
 func registerBucketDownsample(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
 	cmd := app.Command(component.Downsample.String(), "Continuously downsamples blocks in an object store bucket.")
-	httpAddr, httpGracePeriod := extkingpin.RegisterHTTPFlags(cmd)
+	httpAddr, httpGracePeriod, httpTLSConfig := extkingpin.RegisterHTTPFlags(cmd)
+	downsampleConcurrency := cmd.Flag("downsample.concurrency", "Number of goroutines to use when downsampling blocks.").
+		Default("1").Int()
 	dataDir := cmd.Flag("data-dir", "Data directory in which to cache blocks and process downsamplings.").
 		Default("./data").String()
 	hashFunc := cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").Enum("SHA256", "")
 
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
-		return RunDownsample(g, logger, reg, *httpAddr, time.Duration(*httpGracePeriod), *dataDir, objStoreConfig, component.Downsample, metadata.HashFunc(*hashFunc))
+		return RunDownsample(g, logger, reg, *httpAddr, *httpTLSConfig, time.Duration(*httpGracePeriod), *dataDir, *downsampleConcurrency, objStoreConfig, component.Downsample, metadata.HashFunc(*hashFunc))
 	})
 }
 
@@ -642,19 +646,21 @@ func printTable(blockMetas []*metadata.Meta, selectorLabels labels.Labels, sortB
 		}
 
 		var line []string
-		line = append(line, blockMeta.ULID.String())
-		line = append(line, time.Unix(blockMeta.MinTime/1000, 0).Format("02-01-2006 15:04:05"))
-		line = append(line, time.Unix(blockMeta.MaxTime/1000, 0).Format("02-01-2006 15:04:05"))
-		line = append(line, timeRange.String())
-		line = append(line, untilDown)
-		line = append(line, p.Sprintf("%d", blockMeta.Stats.NumSeries))
-		line = append(line, p.Sprintf("%d", blockMeta.Stats.NumSamples))
-		line = append(line, p.Sprintf("%d", blockMeta.Stats.NumChunks))
-		line = append(line, p.Sprintf("%d", blockMeta.Compaction.Level))
-		line = append(line, p.Sprintf("%t", blockMeta.Compaction.Failed))
-		line = append(line, strings.Join(labels, ","))
-		line = append(line, time.Duration(blockMeta.Thanos.Downsample.Resolution*int64(time.Millisecond)).String())
-		line = append(line, string(blockMeta.Thanos.Source))
+		line = append(line,
+			blockMeta.ULID.String(),
+			time.Unix(blockMeta.MinTime/1000, 0).Format("02-01-2006 15:04:05"),
+			time.Unix(blockMeta.MaxTime/1000, 0).Format("02-01-2006 15:04:05"),
+			timeRange.String(),
+			untilDown,
+			p.Sprintf("%d", blockMeta.Stats.NumSeries),
+			p.Sprintf("%d", blockMeta.Stats.NumSamples),
+			p.Sprintf("%d", blockMeta.Stats.NumChunks),
+			p.Sprintf("%d", blockMeta.Compaction.Level),
+			p.Sprintf("%t", blockMeta.Compaction.Failed),
+			strings.Join(labels, ","),
+			time.Duration(blockMeta.Thanos.Downsample.Resolution*int64(time.Millisecond)).String(),
+			string(blockMeta.Thanos.Source))
+
 		lines = append(lines, line)
 	}
 
@@ -819,9 +825,11 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 	hashFunc := cmd.Flag("hash-func", "Specify which hash function to use when calculating the hashes of produced files. If no function has been specified, it does not happen. This permits avoiding downloading some files twice albeit at some performance cost. Possible values are: \"\", \"SHA256\".").
 		Default("").Enum("SHA256", "")
 	dryRun := cmd.Flag("dry-run", "Prints the series changes instead of doing them. Defaults to true, for user to double check. (: Pass --no-dry-run to skip this.").Default("true").Bool()
-	toDelete := extflag.RegisterPathOrContent(cmd, "rewrite.to-delete-config", "YAML file that contains []metadata.DeletionRequest that will be applied to blocks", true)
+	toDelete := extflag.RegisterPathOrContent(cmd, "rewrite.to-delete-config", "YAML file that contains []metadata.DeletionRequest that will be applied to blocks", extflag.WithEnvSubstitution())
+	toRelabel := extflag.RegisterPathOrContent(cmd, "rewrite.to-relabel-config", "YAML file that contains relabel configs that will be applied to blocks", extflag.WithEnvSubstitution())
 	provideChangeLog := cmd.Flag("rewrite.add-change-log", "If specified, all modifications are written to new block directory. Disable if latency is to high.").Default("true").Bool()
 	promBlocks := cmd.Flag("prom-blocks", "If specified, we assume the blocks to be uploaded are only used with Prometheus so we don't check external labels in this case.").Default("false").Bool()
+	deleteBlocks := cmd.Flag("delete-blocks", "Whether to delete the original blocks after rewriting blocks successfully. Available in non dry-run mode only.").Default("false").Bool()
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		confContentYaml, err := objStoreConfig.Content()
 		if err != nil {
@@ -833,14 +841,35 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 			return err
 		}
 
+		var modifiers []compactv2.Modifier
+
+		relabelYaml, err := toRelabel.Content()
+		if err != nil {
+			return err
+		}
+		var relabels []*relabel.Config
+		if len(relabelYaml) > 0 {
+			relabels, err = block.ParseRelabelConfig(relabelYaml, nil)
+			if err != nil {
+				return err
+			}
+			modifiers = append(modifiers, compactv2.WithRelabelModifier(relabels...))
+		}
+
 		deletionsYaml, err := toDelete.Content()
 		if err != nil {
 			return err
 		}
-
 		var deletions []metadata.DeletionRequest
-		if err := yaml.Unmarshal(deletionsYaml, &deletions); err != nil {
-			return err
+		if len(deletionsYaml) > 0 {
+			if err := yaml.Unmarshal(deletionsYaml, &deletions); err != nil {
+				return err
+			}
+			modifiers = append(modifiers, compactv2.WithDeletionModifier(deletions...))
+		}
+
+		if len(modifiers) == 0 {
+			return errors.New("rewrite configuration should be provided")
 		}
 
 		var ids []ulid.ULID
@@ -863,6 +892,7 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 		g.Add(func() error {
 			chunkPool := chunkenc.NewPool()
 			changeLog := compactv2.NewChangeLog(ioutil.Discard)
+			stubCounter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
 			for _, id := range ids {
 				// Delete series from block & modify.
 				level.Info(logger).Log("msg", "downloading block", "source", id)
@@ -885,6 +915,7 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 				meta.Thanos.Rewrites = append(meta.Thanos.Rewrites, metadata.Rewrite{
 					Sources:          meta.Compaction.Sources,
 					DeletionsApplied: deletions,
+					RelabelsApplied:  relabels,
 				})
 				meta.Compaction.Sources = []ulid.ULID{newID}
 				meta.Thanos.Source = metadata.BucketRewriteSource
@@ -916,8 +947,8 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 					comp = compactv2.New(*tmpDir, logger, changeLog, chunkPool)
 				}
 
-				level.Info(logger).Log("msg", "starting rewrite for block", "source", id, "new", newID, "toDelete", string(deletionsYaml))
-				if err := comp.WriteSeries(ctx, []block.Reader{b}, d, p, compactv2.WithDeletionModifier(deletions...)); err != nil {
+				level.Info(logger).Log("msg", "starting rewrite for block", "source", id, "new", newID, "toDelete", string(deletionsYaml), "toRelabel", string(relabelYaml))
+				if err := comp.WriteSeries(ctx, []block.Reader{b}, d, p, modifiers...); err != nil {
 					return errors.Wrapf(err, "writing series from %v to %v", id, newID)
 				}
 
@@ -946,12 +977,132 @@ func registerBucketRewrite(app extkingpin.AppClause, objStoreConfig *extflag.Pat
 					}
 				}
 				level.Info(logger).Log("msg", "uploaded", "source", id, "new", newID)
+
+				if !*dryRun && *deleteBlocks {
+					if err := block.MarkForDeletion(ctx, logger, bkt, id, "block rewritten", stubCounter); err != nil {
+						level.Error(logger).Log("msg", "failed to mark block for deletion", "id", id.String(), "err", err)
+					}
+				}
 			}
 			level.Info(logger).Log("msg", "rewrite done", "IDs", strings.Join(*blockIDs, ","))
 			return nil
 		}, func(err error) {
 			cancel()
 		})
+		return nil
+	})
+}
+
+func registerBucketRetention(app extkingpin.AppClause, objStoreConfig *extflag.PathOrContent) {
+	var (
+		retentionRaw, retentionFiveMin, retentionOneHr prommodel.Duration
+	)
+
+	cmd := app.Command("retention", "Retention applies retention policies on the given bucket. Please make sure no compactor is running on the same bucket at the same time.")
+	deleteDelay := cmd.Flag("delete-delay", "Time before a block marked for deletion is deleted from bucket.").Default("48h").Duration()
+	consistencyDelay := cmd.Flag("consistency-delay", fmt.Sprintf("Minimum age of fresh (non-compacted) blocks before they are being processed. Malformed blocks older than the maximum of consistency-delay and %v will be removed.", compact.PartialUploadThresholdAge)).
+		Default("30m").Duration()
+	blockSyncConcurrency := cmd.Flag("block-sync-concurrency", "Number of goroutines to use when syncing block metadata from object storage.").
+		Default("20").Int()
+	selectorRelabelConf := extkingpin.RegisterSelectorRelabelFlags(cmd)
+	cmd.Flag("retention.resolution-raw",
+		"How long to retain raw samples in bucket. Setting this to 0d will retain samples of this resolution forever").
+		Default("0d").SetValue(&retentionRaw)
+	cmd.Flag("retention.resolution-5m", "How long to retain samples of resolution 1 (5 minutes) in bucket. Setting this to 0d will retain samples of this resolution forever").
+		Default("0d").SetValue(&retentionFiveMin)
+	cmd.Flag("retention.resolution-1h", "How long to retain samples of resolution 2 (1 hour) in bucket. Setting this to 0d will retain samples of this resolution forever").
+		Default("0d").SetValue(&retentionOneHr)
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, _ opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+		retentionByResolution := map[compact.ResolutionLevel]time.Duration{
+			compact.ResolutionLevelRaw: time.Duration(retentionRaw),
+			compact.ResolutionLevel5m:  time.Duration(retentionFiveMin),
+			compact.ResolutionLevel1h:  time.Duration(retentionOneHr),
+		}
+
+		if retentionByResolution[compact.ResolutionLevelRaw].Seconds() != 0 {
+			level.Info(logger).Log("msg", "retention policy of raw samples is enabled", "duration", retentionByResolution[compact.ResolutionLevelRaw])
+		}
+		if retentionByResolution[compact.ResolutionLevel5m].Seconds() != 0 {
+			level.Info(logger).Log("msg", "retention policy of 5 min aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel5m])
+		}
+		if retentionByResolution[compact.ResolutionLevel1h].Seconds() != 0 {
+			level.Info(logger).Log("msg", "retention policy of 1 hour aggregated samples is enabled", "duration", retentionByResolution[compact.ResolutionLevel1h])
+		}
+
+		confContentYaml, err := objStoreConfig.Content()
+		if err != nil {
+			return err
+		}
+
+		relabelContentYaml, err := selectorRelabelConf.Content()
+		if err != nil {
+			return errors.Wrap(err, "get content of relabel configuration")
+		}
+
+		relabelConfig, err := block.ParseRelabelConfig(relabelContentYaml, block.SelectorSupportedRelabelActions)
+		if err != nil {
+			return err
+		}
+
+		bkt, err := client.NewBucket(logger, confContentYaml, reg, component.Rewrite.String())
+		if err != nil {
+			return err
+		}
+
+		// Dummy actor to immediately kill the group after the run function returns.
+		g.Add(func() error { return nil }, func(error) {})
+
+		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
+
+		// While fetching blocks, we filter out blocks that were marked for deletion by using IgnoreDeletionMarkFilter.
+		// The delay of deleteDelay/2 is added to ensure we fetch blocks that are meant to be deleted but do not have a replacement yet.
+		// This is to make sure compactor will not accidentally perform compactions with gap instead.
+		ignoreDeletionMarkFilter := block.NewIgnoreDeletionMarkFilter(logger, bkt, *deleteDelay/2, block.FetcherConcurrency)
+		duplicateBlocksFilter := block.NewDeduplicateFilter()
+		stubCounter := promauto.With(nil).NewCounter(prometheus.CounterOpts{})
+
+		var sy *compact.Syncer
+		{
+			baseMetaFetcher, err := block.NewBaseFetcher(logger, block.FetcherConcurrency, bkt, "", extprom.WrapRegistererWithPrefix(extpromPrefix, reg))
+			if err != nil {
+				return errors.Wrap(err, "create meta fetcher")
+			}
+			cf := baseMetaFetcher.NewMetaFetcher(
+				extprom.WrapRegistererWithPrefix(extpromPrefix, reg), []block.MetadataFilter{
+					block.NewLabelShardedMetaFilter(relabelConfig),
+					block.NewConsistencyDelayMetaFilter(logger, *consistencyDelay, extprom.WrapRegistererWithPrefix(extpromPrefix, reg)),
+					duplicateBlocksFilter,
+					ignoreDeletionMarkFilter,
+				}, []block.MetadataModifier{block.NewReplicaLabelRemover(logger, make([]string, 0))},
+			)
+			sy, err = compact.NewMetaSyncer(
+				logger,
+				reg,
+				bkt,
+				cf,
+				duplicateBlocksFilter,
+				ignoreDeletionMarkFilter,
+				stubCounter,
+				stubCounter,
+				*blockSyncConcurrency)
+			if err != nil {
+				return errors.Wrap(err, "create syncer")
+			}
+		}
+
+		ctx := context.Background()
+		level.Info(logger).Log("msg", "syncing blocks metadata")
+		if err := sy.SyncMetas(ctx); err != nil {
+			return errors.Wrap(err, "sync blocks")
+		}
+
+		level.Info(logger).Log("msg", "synced blocks done")
+
+		level.Warn(logger).Log("msg", "GLOBAL COMPACTOR SHOULD __NOT__ BE RUNNING ON THE SAME BUCKET")
+
+		if err := compact.ApplyRetentionPolicyByResolution(ctx, logger, bkt, sy.Metas(), retentionByResolution, stubCounter); err != nil {
+			return errors.Wrap(err, "retention failed")
+		}
 		return nil
 	})
 }

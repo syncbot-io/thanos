@@ -43,6 +43,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
+	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/filesystem"
 	"github.com/thanos-io/thanos/pkg/pool"
@@ -875,7 +876,7 @@ func testSharding(t *testing.T, reuseDisk string, bkt objstore.Bucket, all ...ul
 	}
 }
 
-func expectedTouchedBlockOps(all []ulid.ULID, expected []ulid.ULID, cached []ulid.ULID) []string {
+func expectedTouchedBlockOps(all, expected, cached []ulid.ULID) []string {
 	var ops []string
 	for _, id := range all {
 		blockCached := false
@@ -1070,7 +1071,7 @@ func appendTestData(t testing.TB, app storage.Appender, series int) {
 }
 
 func createBlockFromHead(t testing.TB, dir string, head *tsdb.Head) ulid.ULID {
-	compactor, err := tsdb.NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil)
+	compactor, err := tsdb.NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil, nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, os.MkdirAll(dir, 0777))
@@ -1478,7 +1479,7 @@ func TestBucketSeries_OneBlock_InMemIndexCacheSegfault(t *testing.T) {
 			b1.meta.ULID: b1,
 			b2.meta.ULID: b2,
 		},
-		queryGate:            noopGate{},
+		queryGate:            gate.NewNoop(),
 		chunksLimiterFactory: NewChunksLimiterFactory(0),
 		seriesLimiterFactory: NewSeriesLimiterFactory(0),
 	}
@@ -1817,130 +1818,7 @@ func TestBigEndianPostingsCount(t *testing.T) {
 	testutil.Equals(t, count, c)
 }
 
-func TestBlockWithLargeChunks(t *testing.T) {
-	defer testutil.TolerantVerifyLeak(t)
-
-	tmpDir, err := ioutil.TempDir(os.TempDir(), "large-chunk-test")
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		_ = os.RemoveAll(tmpDir)
-	})
-
-	blockDir := filepath.Join(tmpDir, "block")
-	b := createBlockWithLargeChunk(testutil.NewTB(t), blockDir, labels.FromStrings("__name__", "test"), rand.New(rand.NewSource(0)))
-
-	thanosMeta := metadata.Thanos{
-		Labels:     labels.Labels{{Name: "ext1", Value: "1"}}.Map(),
-		Downsample: metadata.ThanosDownsample{Resolution: 0},
-		Source:     metadata.TestSource,
-	}
-
-	_, err = metadata.InjectThanos(log.NewNopLogger(), filepath.Join(blockDir, b.String()), thanosMeta, nil)
-	testutil.Ok(t, err)
-
-	bucketDir := filepath.Join(os.TempDir(), "bkt")
-	bkt, err := filesystem.NewBucket(bucketDir)
-	testutil.Ok(t, err)
-	t.Cleanup(func() {
-		_ = os.RemoveAll(bucketDir)
-	})
-
-	logger := log.NewNopLogger()
-	instrBkt := objstore.WithNoopInstr(bkt)
-
-	testutil.Ok(t, block.Upload(context.Background(), logger, bkt, filepath.Join(blockDir, b.String()), metadata.NoneFunc))
-
-	// Instance a real bucket store we'll use to query the series.
-	fetcher, err := block.NewMetaFetcher(logger, 10, instrBkt, tmpDir, nil, nil, nil)
-	testutil.Ok(t, err)
-
-	indexCache, err := storecache.NewInMemoryIndexCacheWithConfig(logger, nil, storecache.InMemoryIndexCacheConfig{})
-	testutil.Ok(t, err)
-
-	chunkPool, err := NewDefaultChunkBytesPool(1000000)
-	testutil.Ok(t, err)
-
-	store, err := NewBucketStore(
-		instrBkt,
-		fetcher,
-		tmpDir,
-		NewChunksLimiterFactory(10000/MaxSamplesPerChunk),
-		NewSeriesLimiterFactory(0),
-		NewGapBasedPartitioner(PartitionerMaxGapSize),
-		10,
-		false,
-		DefaultPostingOffsetInMemorySampling,
-		true,
-		false,
-		0,
-		WithLogger(logger),
-		WithIndexCache(indexCache),
-		WithChunkPool(chunkPool),
-	)
-	testutil.Ok(t, err)
-	defer func() { testutil.Ok(t, store.Close()) }()
-
-	testutil.Ok(t, store.SyncBlocks(context.Background()))
-
-	req := &storepb.SeriesRequest{
-		MinTime: math.MinInt64,
-		MaxTime: math.MaxInt64,
-		Matchers: []storepb.LabelMatcher{
-			{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "test"},
-		},
-	}
-	srv := newStoreSeriesServer(context.Background())
-	testutil.Ok(t, store.Series(req, srv))
-	testutil.Equals(t, 1, len(srv.SeriesSet))
-}
-
-// This method relies on a bug in TSDB Compactor which will just merge overlapping chunks into one big chunk.
-// If compactor is fixed in the future, we may need a different way of generating the block, or commit
-// existing block to the repository.
-func createBlockWithLargeChunk(t testutil.TB, dir string, lbls labels.Labels, random *rand.Rand) ulid.ULID {
-	// Block covering time [0 ... 10000)
-	b1 := createBlockWithOneSeriesWithStep(t, dir, lbls, 0, 10000, random, 1)
-
-	// This block has only 11 samples that fit into one chunk, but it completely overlaps entire first block.
-	// Last sample has higher timestamp than last sample in b1.
-	// This will make compactor to merge all chunks into one.
-	b2 := createBlockWithOneSeriesWithStep(t, dir, lbls, 0, 11, random, 1000)
-
-	// Merge the blocks together.
-	compactor, err := tsdb.NewLeveledCompactor(context.Background(), nil, log.NewNopLogger(), []int64{1000000}, nil)
-	testutil.Ok(t, err)
-
-	blocksToCompact := []string{filepath.Join(dir, b1.String()), filepath.Join(dir, b2.String())}
-	newBlock, err := compactor.Compact(dir, blocksToCompact, nil)
-	testutil.Ok(t, err)
-
-	for _, b := range blocksToCompact {
-		testutil.Ok(t, os.RemoveAll(b))
-	}
-
-	db, err := tsdb.Open(dir, nil, nil, tsdb.DefaultOptions())
-	defer func() {
-		testutil.Ok(t, db.Close())
-	}()
-	testutil.Ok(t, err)
-	bs := db.Blocks()
-	testutil.Equals(t, 1, len(bs))
-	cr, err := bs[0].Chunks()
-	defer func() {
-		testutil.Ok(t, cr.Close())
-	}()
-	testutil.Ok(t, err)
-	// Ref is (<segment file index> << 32 + offset in the file). In TSDB v1 first chunk is always at offset 8.
-	c, err := cr.Chunk(8)
-	testutil.Ok(t, err)
-
-	// Make sure that this is really a big chunk, otherwise this method makes a false promise.
-	testutil.Equals(t, 10001, c.NumSamples())
-
-	return newBlock
-}
-
-func createBlockWithOneSeriesWithStep(t testutil.TB, dir string, lbls labels.Labels, blockIndex int, totalSamples int, random *rand.Rand, step int64) ulid.ULID {
+func createBlockWithOneSeriesWithStep(t testutil.TB, dir string, lbls labels.Labels, blockIndex, totalSamples int, random *rand.Rand, step int64) ulid.ULID {
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = dir
 	headOpts.ChunkRange = int64(totalSamples) * step
@@ -2388,7 +2266,7 @@ func benchmarkBlockSeriesWithConcurrency(b *testing.B, concurrency int, blockMet
 				indexReader := blk.indexReader(ctx)
 				chunkReader := blk.chunkReader(ctx)
 
-				seriesSet, _, err := blockSeries(nil, indexReader, chunkReader, matchers, req, chunksLimiter, seriesLimiter)
+				seriesSet, _, err := blockSeries(nil, indexReader, chunkReader, matchers, chunksLimiter, seriesLimiter, req.SkipChunks, req.MinTime, req.MaxTime, req.Aggregates)
 				testutil.Ok(b, err)
 
 				// Ensure at least 1 series has been returned (as expected).

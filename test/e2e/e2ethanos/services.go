@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cortexproject/cortex/integration/e2e"
@@ -36,9 +37,13 @@ var defaultBackoffConfig = util.BackoffConfig{
 	MaxRetries: 50,
 }
 
+const (
+	FeatureExemplarStorage = "exemplar-storage"
+)
+
 // TODO(bwplotka): Run against multiple?
 func DefaultPrometheusImage() string {
-	return "quay.io/prometheus/prometheus:v2.19.3"
+	return "quay.io/prometheus/prometheus:v2.26.0"
 }
 
 func DefaultAlertmanagerImage() string {
@@ -55,14 +60,14 @@ func DefaultImage() string {
 	return "thanos"
 }
 
-func NewPrometheus(sharedDir string, name string, config, promImage string) (*e2e.HTTPService, string, error) {
+func NewPrometheus(sharedDir, name, config, promImage string, enableFeatures ...string) (*e2e.HTTPService, string, error) {
 	dir := filepath.Join(sharedDir, "data", "prometheus", name)
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "prometheus", name)
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, "", errors.Wrap(err, "create prometheus dir")
 	}
 
-	if err := ioutil.WriteFile(filepath.Join(dir, "prometheus.yml"), []byte(config), 0666); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(dir, "prometheus.yml"), []byte(config), 0600); err != nil {
 		return nil, "", errors.Wrap(err, "creating prom config failed")
 	}
 
@@ -73,6 +78,10 @@ func NewPrometheus(sharedDir string, name string, config, promImage string) (*e2
 		"--log.level":                       infoLogLevel,
 		"--web.listen-address":              ":9090",
 	})
+
+	if len(enableFeatures) > 0 {
+		args = append(args, fmt.Sprintf("--enable-feature=%s", strings.Join(enableFeatures, ",")))
+	}
 	prom := e2e.NewHTTPService(
 		fmt.Sprintf("prometheus-%s", name),
 		promImage,
@@ -86,8 +95,8 @@ func NewPrometheus(sharedDir string, name string, config, promImage string) (*e2
 	return prom, container, nil
 }
 
-func NewPrometheusWithSidecar(sharedDir string, netName string, name string, config, promImage string) (*e2e.HTTPService, *Service, error) {
-	prom, dataDir, err := NewPrometheus(sharedDir, name, config, promImage)
+func NewPrometheusWithSidecar(sharedDir, netName, name, config, promImage string, enableFeatures ...string) (*e2e.HTTPService, *Service, error) {
+	prom, dataDir, err := NewPrometheus(sharedDir, name, config, promImage, enableFeatures...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -115,11 +124,75 @@ func NewPrometheusWithSidecar(sharedDir string, netName string, name string, con
 	return prom, sidecar, nil
 }
 
-func NewQuerier(sharedDir, name string, storeAddresses, fileSDStoreAddresses, ruleAddresses, targetAddresses []string, metadataAddresses, exemplarAddresses []string, routePrefix, externalPrefix string) (*Service, error) {
+type QuerierBuilder struct {
+	sharedDir      string
+	name           string
+	routePrefix    string
+	externalPrefix string
+
+	storeAddresses       []string
+	fileSDStoreAddresses []string
+	ruleAddresses        []string
+	metadataAddresses    []string
+	targetAddresses      []string
+	exemplarAddresses    []string
+
+	tracingConfig string
+}
+
+func NewQuerierBuilder(sharedDir, name string, storeAddresses []string) *QuerierBuilder {
+	return &QuerierBuilder{
+		sharedDir:      sharedDir,
+		name:           name,
+		storeAddresses: storeAddresses,
+	}
+}
+
+func (q *QuerierBuilder) WithFileSDStoreAddresses(fileSDStoreAddresses []string) *QuerierBuilder {
+	q.fileSDStoreAddresses = fileSDStoreAddresses
+	return q
+}
+
+func (q *QuerierBuilder) WithRuleAddresses(ruleAddresses []string) *QuerierBuilder {
+	q.ruleAddresses = ruleAddresses
+	return q
+}
+
+func (q *QuerierBuilder) WithTargetAddresses(targetAddresses []string) *QuerierBuilder {
+	q.targetAddresses = targetAddresses
+	return q
+}
+
+func (q *QuerierBuilder) WithExemplarAddresses(exemplarAddresses []string) *QuerierBuilder {
+	q.exemplarAddresses = exemplarAddresses
+	return q
+}
+
+func (q *QuerierBuilder) WithMetadataAddresses(metadataAddresses []string) *QuerierBuilder {
+	q.metadataAddresses = metadataAddresses
+	return q
+}
+
+func (q *QuerierBuilder) WithRoutePrefix(routePrefix string) *QuerierBuilder {
+	q.routePrefix = routePrefix
+	return q
+}
+
+func (q *QuerierBuilder) WithExternalPrefix(externalPrefix string) *QuerierBuilder {
+	q.externalPrefix = externalPrefix
+	return q
+}
+
+func (q *QuerierBuilder) WithTracingConfig(tracingConfig string) *QuerierBuilder {
+	q.tracingConfig = tracingConfig
+	return q
+}
+
+func (q *QuerierBuilder) Build() (*Service, error) {
 	const replicaLabel = "replica"
 
 	args := e2e.BuildArgs(map[string]string{
-		"--debug.name":            fmt.Sprintf("querier-%v", name),
+		"--debug.name":            fmt.Sprintf("querier-%v", q.name),
 		"--grpc-address":          ":9091",
 		"--grpc-grace-period":     "0s",
 		"--http-address":          ":8080",
@@ -129,35 +202,35 @@ func NewQuerier(sharedDir, name string, storeAddresses, fileSDStoreAddresses, ru
 		"--query.max-concurrent":  "1",
 		"--store.sd-interval":     "5s",
 	})
-	for _, addr := range storeAddresses {
+	for _, addr := range q.storeAddresses {
 		args = append(args, "--store="+addr)
 	}
 
-	for _, addr := range ruleAddresses {
+	for _, addr := range q.ruleAddresses {
 		args = append(args, "--rule="+addr)
 	}
 
-	for _, addr := range targetAddresses {
+	for _, addr := range q.targetAddresses {
 		args = append(args, "--target="+addr)
 	}
 
-	for _, addr := range metadataAddresses {
+	for _, addr := range q.metadataAddresses {
 		args = append(args, "--metadata="+addr)
 	}
 
-	for _, addr := range exemplarAddresses {
+	for _, addr := range q.exemplarAddresses {
 		args = append(args, "--exemplar="+addr)
 	}
 
-	if len(fileSDStoreAddresses) > 0 {
-		queryFileSDDir := filepath.Join(sharedDir, "data", "querier", name)
-		container := filepath.Join(e2e.ContainerSharedDir, "data", "querier", name)
-		if err := os.MkdirAll(queryFileSDDir, 0777); err != nil {
+	if len(q.fileSDStoreAddresses) > 0 {
+		queryFileSDDir := filepath.Join(q.sharedDir, "data", "querier", q.name)
+		container := filepath.Join(e2e.ContainerSharedDir, "data", "querier", q.name)
+		if err := os.MkdirAll(queryFileSDDir, 0750); err != nil {
 			return nil, errors.Wrap(err, "create query dir failed")
 		}
 
 		fileSD := []*targetgroup.Group{{}}
-		for _, a := range fileSDStoreAddresses {
+		for _, a := range q.fileSDStoreAddresses {
 			fileSD[0].Targets = append(fileSD[0].Targets, model.LabelSet{model.AddressLabel: model.LabelValue(a)})
 		}
 
@@ -166,23 +239,27 @@ func NewQuerier(sharedDir, name string, storeAddresses, fileSDStoreAddresses, ru
 			return nil, err
 		}
 
-		if err := ioutil.WriteFile(queryFileSDDir+"/filesd.yaml", b, 0666); err != nil {
+		if err := ioutil.WriteFile(queryFileSDDir+"/filesd.yaml", b, 0600); err != nil {
 			return nil, errors.Wrap(err, "creating query SD config failed")
 		}
 
 		args = append(args, "--store.sd-files="+filepath.Join(container, "filesd.yaml"))
 	}
 
-	if routePrefix != "" {
-		args = append(args, "--web.route-prefix="+routePrefix)
+	if q.routePrefix != "" {
+		args = append(args, "--web.route-prefix="+q.routePrefix)
 	}
 
-	if externalPrefix != "" {
-		args = append(args, "--web.external-prefix="+externalPrefix)
+	if q.externalPrefix != "" {
+		args = append(args, "--web.external-prefix="+q.externalPrefix)
+	}
+
+	if q.tracingConfig != "" {
+		args = append(args, "--tracing.config="+q.tracingConfig)
 	}
 
 	querier := NewService(
-		fmt.Sprintf("querier-%v", name),
+		fmt.Sprintf("querier-%v", q.name),
 		DefaultImage(),
 		e2e.NewCommand("query", args...),
 		e2e.NewHTTPReadinessProbe(8080, "/-/ready", 200, 200),
@@ -197,7 +274,9 @@ func NewQuerier(sharedDir, name string, storeAddresses, fileSDStoreAddresses, ru
 
 func RemoteWriteEndpoint(addr string) string { return fmt.Sprintf("http://%s/api/v1/receive", addr) }
 
-func NewReceiver(sharedDir string, networkName string, name string, replicationFactor int, hashring ...receive.HashringConfig) (*Service, error) {
+// NewRoutingAndIngestingReceiver creates a Thanos Receive instances that is configured both for ingesting samples and routing samples to other receivers.
+func NewRoutingAndIngestingReceiver(sharedDir, networkName, name string, replicationFactor int, hashring ...receive.HashringConfig) (*Service, error) {
+
 	localEndpoint := NewService(fmt.Sprintf("receive-%v", name), "", e2e.NewCommand("", ""), nil, 8080, 9091, 8081).GRPCNetworkEndpointFor(networkName)
 	if len(hashring) == 0 {
 		hashring = []receive.HashringConfig{{Endpoints: []string{localEndpoint}}}
@@ -206,7 +285,7 @@ func NewReceiver(sharedDir string, networkName string, name string, replicationF
 	dir := filepath.Join(sharedDir, "data", "receive", name)
 	dataDir := filepath.Join(dir, "data")
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "receive", name)
-	if err := os.MkdirAll(dataDir, 0777); err != nil {
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create receive dir")
 	}
 	b, err := json.Marshal(hashring)
@@ -242,7 +321,85 @@ func NewReceiver(sharedDir string, networkName string, name string, replicationF
 	return receiver, nil
 }
 
-func NewReceiverWithConfigWatcher(sharedDir string, networkName string, name string, replicationFactor int, hashring ...receive.HashringConfig) (*Service, error) {
+// NewRoutingReceiver creates a Thanos Receive instance that is only configured to route to other receive instances. It has no local storage.
+func NewRoutingReceiver(sharedDir, name string, replicationFactor int, hashring ...receive.HashringConfig) (*Service, error) {
+
+	if len(hashring) == 0 {
+		return nil, errors.New("hashring should not be empty for receive-distributor mode")
+	}
+
+	dir := filepath.Join(sharedDir, "data", "receive", name)
+	dataDir := filepath.Join(dir, "data")
+	container := filepath.Join(e2e.ContainerSharedDir, "data", "receive", name)
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
+		return nil, errors.Wrap(err, "create receive dir")
+	}
+	b, err := json.Marshal(hashring)
+	if err != nil {
+		return nil, errors.Wrapf(err, "generate hashring file: %v", hashring)
+	}
+
+	receiver := NewService(
+		fmt.Sprintf("receive-%v", name),
+		DefaultImage(),
+		// TODO(bwplotka): BuildArgs should be interface.
+		e2e.NewCommand("receive", e2e.BuildArgs(map[string]string{
+			"--debug.name":                 fmt.Sprintf("receive-%v", name),
+			"--grpc-address":               ":9091",
+			"--grpc-grace-period":          "0s",
+			"--http-address":               ":8080",
+			"--remote-write.address":       ":8081",
+			"--label":                      fmt.Sprintf(`receive="%s"`, name),
+			"--tsdb.path":                  filepath.Join(container, "data"),
+			"--log.level":                  infoLogLevel,
+			"--receive.replication-factor": strconv.Itoa(replicationFactor),
+			"--receive.hashrings":          string(b),
+		})...),
+		e2e.NewHTTPReadinessProbe(8080, "/-/ready", 200, 200),
+		8080,
+		9091,
+		8081,
+	)
+	receiver.SetUser(strconv.Itoa(os.Getuid()))
+	receiver.SetBackoff(defaultBackoffConfig)
+
+	return receiver, nil
+}
+
+// NewIngestingReceiver creates a Thanos Receive instance that is only configured to ingest, not route to other receivers.
+func NewIngestingReceiver(sharedDir, name string) (*Service, error) {
+	dir := filepath.Join(sharedDir, "data", "receive", name)
+	dataDir := filepath.Join(dir, "data")
+	container := filepath.Join(e2e.ContainerSharedDir, "data", "receive", name)
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
+		return nil, errors.Wrap(err, "create receive dir")
+	}
+	receiver := NewService(
+		fmt.Sprintf("receive-%v", name),
+		DefaultImage(),
+		// TODO(bwplotka): BuildArgs should be interface.
+		e2e.NewCommand("receive", e2e.BuildArgs(map[string]string{
+			"--debug.name":           fmt.Sprintf("receive-%v", name),
+			"--grpc-address":         ":9091",
+			"--grpc-grace-period":    "0s",
+			"--http-address":         ":8080",
+			"--remote-write.address": ":8081",
+			"--label":                fmt.Sprintf(`receive="%s"`, name),
+			"--tsdb.path":            filepath.Join(container, "data"),
+			"--log.level":            infoLogLevel,
+		})...),
+		e2e.NewHTTPReadinessProbe(8080, "/-/ready", 200, 200),
+		8080,
+		9091,
+		8081,
+	)
+	receiver.SetUser(strconv.Itoa(os.Getuid()))
+	receiver.SetBackoff(defaultBackoffConfig)
+
+	return receiver, nil
+}
+
+func NewRoutingAndIngestingReceiverWithConfigWatcher(sharedDir, networkName, name string, replicationFactor int, hashring ...receive.HashringConfig) (*Service, error) {
 	localEndpoint := NewService(fmt.Sprintf("receive-%v", name), "", e2e.NewCommand("", ""), nil, 8080, 9091, 8081).GRPCNetworkEndpointFor(networkName)
 	if len(hashring) == 0 {
 		hashring = []receive.HashringConfig{{Endpoints: []string{localEndpoint}}}
@@ -251,7 +408,7 @@ func NewReceiverWithConfigWatcher(sharedDir string, networkName string, name str
 	dir := filepath.Join(sharedDir, "data", "receive", name)
 	dataDir := filepath.Join(dir, "data")
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "receive", name)
-	if err := os.MkdirAll(dataDir, 0777); err != nil {
+	if err := os.MkdirAll(dataDir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create receive dir")
 	}
 	b, err := json.Marshal(hashring)
@@ -259,7 +416,7 @@ func NewReceiverWithConfigWatcher(sharedDir string, networkName string, name str
 		return nil, errors.Wrapf(err, "generate hashring file: %v", hashring)
 	}
 
-	if err := ioutil.WriteFile(filepath.Join(dir, "hashrings.json"), b, 0666); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(dir, "hashrings.json"), b, 0600); err != nil {
 		return nil, errors.Wrap(err, "creating receive config")
 	}
 
@@ -292,10 +449,10 @@ func NewReceiverWithConfigWatcher(sharedDir string, networkName string, name str
 	return receiver, nil
 }
 
-func NewRuler(sharedDir string, name string, ruleSubDir string, amCfg []alert.AlertmanagerConfig, queryCfg []query.Config) (*Service, error) {
+func NewRuler(sharedDir, name, ruleSubDir string, amCfg []alert.AlertmanagerConfig, queryCfg []query.Config) (*Service, error) {
 	dir := filepath.Join(sharedDir, "data", "rule", name)
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "rule", name)
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create rule dir")
 	}
 
@@ -340,10 +497,10 @@ func NewRuler(sharedDir string, name string, ruleSubDir string, amCfg []alert.Al
 	return ruler, nil
 }
 
-func NewAlertmanager(sharedDir string, name string) (*e2e.HTTPService, error) {
+func NewAlertmanager(sharedDir, name string) (*e2e.HTTPService, error) {
 	dir := filepath.Join(sharedDir, "data", "am", name)
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "am", name)
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create am dir")
 	}
 	const config = `
@@ -355,7 +512,7 @@ route:
 receivers:
 - name: 'null'
 `
-	if err := ioutil.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0666); err != nil {
+	if err := ioutil.WriteFile(filepath.Join(dir, "config.yaml"), []byte(config), 0600); err != nil {
 		return nil, errors.Wrap(err, "creating alertmanager config file failed")
 	}
 
@@ -379,10 +536,10 @@ receivers:
 	return s, nil
 }
 
-func NewStoreGW(sharedDir string, name string, bucketConfig client.BucketConfig, relabelConfig ...relabel.Config) (*Service, error) {
+func NewStoreGW(sharedDir, name string, bucketConfig client.BucketConfig, relabelConfig ...relabel.Config) (*Service, error) {
 	dir := filepath.Join(sharedDir, "data", "store", name)
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "store", name)
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create store dir")
 	}
 
@@ -424,11 +581,11 @@ func NewStoreGW(sharedDir string, name string, bucketConfig client.BucketConfig,
 	return store, nil
 }
 
-func NewCompactor(sharedDir string, name string, bucketConfig client.BucketConfig, relabelConfig []relabel.Config, extArgs ...string) (*e2e.HTTPService, error) {
+func NewCompactor(sharedDir, name string, bucketConfig client.BucketConfig, relabelConfig []relabel.Config, extArgs ...string) (*e2e.HTTPService, error) {
 	dir := filepath.Join(sharedDir, "data", "compact", name)
 	container := filepath.Join(e2e.ContainerSharedDir, "data", "compact", name)
 
-	if err := os.MkdirAll(dir, 0777); err != nil {
+	if err := os.MkdirAll(dir, 0750); err != nil {
 		return nil, errors.Wrap(err, "create compact dir")
 	}
 
@@ -464,7 +621,7 @@ func NewCompactor(sharedDir string, name string, bucketConfig client.BucketConfi
 	return compactor, nil
 }
 
-func NewQueryFrontend(name string, downstreamURL string, cacheConfig queryfrontend.CacheProviderConfig) (*e2e.HTTPService, error) {
+func NewQueryFrontend(name, downstreamURL string, cacheConfig queryfrontend.CacheProviderConfig) (*e2e.HTTPService, error) {
 	cacheConfigBytes, err := yaml.Marshal(cacheConfig)
 	if err != nil {
 		return nil, errors.Wrapf(err, "marshal response cache config file: %v", cacheConfig)
