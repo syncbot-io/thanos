@@ -9,6 +9,7 @@ replace (
 	github.com/cockroachdb/cmux => github.com/cockroachdb/cmux v0.0.0-20170110192607-30d10be49292
 	github.com/cockroachdb/cockroach => github.com/cockroachdb/cockroach v0.0.0-20170608034007-84bc9597164f
 	github.com/googleapis/gnostic => github.com/googleapis/gnostic v0.2.3-0.20180520015035-48a0ecefe2e4
+	github.com/gophercloud/gophercloud => github.com/gophercloud/gophercloud v0.18.0
 	github.com/miekg/dns => github.com/miekg/dns v1.0.4
 	github.com/prometheus/client_golang => github.com/prometheus/client_golang v0.9.0-pre1.0.20180607123607-faf4ec335fe0
 	github.com/prometheus/common => github.com/prometheus/common v0.0.0-20180518154759-7600349dcfe1
@@ -19,4 +20,48 @@ replace (
 	k8s.io/klog => github.com/simonpasquier/klog-gokit v0.1.0
 )
 
-require github.com/prometheus/prometheus v2.4.3+incompatible // cmd/prometheus
+require (
+	github.com/Azure/azure-sdk-for-go v0.0.0-00010101000000-000000000000 // indirect
+	github.com/Azure/go-autorest v0.0.0-00010101000000-000000000000 // indirect
+	github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751 // indirect
+	github.com/alecthomas/units v0.0.0-20210208195552-ff826a37aa15 // indirect
+	github.com/aws/aws-sdk-go v1.40.23 // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/cockroachdb/cmux v0.0.0-00010101000000-000000000000 // indirect
+	github.com/cockroachdb/cockroach v0.0.0-00010101000000-000000000000 // indirect
+	github.com/go-kit/kit v0.11.0 // indirect
+	github.com/golang/snappy v0.0.4 // indirect
+	github.com/googleapis/gnostic v0.0.0-00010101000000-000000000000 // indirect
+	github.com/gophercloud/gophercloud v0.0.0-00010101000000-000000000000 // indirect
+	github.com/gregjones/httpcache v0.0.0-20190611155906-901d90724c79 // indirect
+	github.com/hashicorp/consul/api v1.9.1 // indirect
+	github.com/jpillora/backoff v1.0.0 // indirect
+	github.com/julienschmidt/httprouter v1.3.0 // indirect
+	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect
+	github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f // indirect
+	github.com/oklog/oklog v0.3.2 // indirect
+	github.com/oklog/run v1.1.0 // indirect
+	github.com/oklog/ulid v1.3.1 // indirect
+	github.com/opentracing-contrib/go-stdlib v1.0.0 // indirect
+	github.com/peterbourgon/diskv v2.0.1+incompatible // indirect
+	github.com/prometheus/client_model v0.2.0 // indirect
+	github.com/prometheus/common v0.0.0-00010101000000-000000000000 // indirect
+	github.com/prometheus/procfs v0.7.3 // indirect
+	github.com/prometheus/prometheus v2.4.3+incompatible // cmd/prometheus
+	github.com/prometheus/tsdb v0.0.0-00010101000000-000000000000 // indirect
+	github.com/samuel/go-zookeeper v0.0.0-20201211165307-7117e9ea2414 // indirect
+	github.com/shurcooL/httpfs v0.0.0-20190707220628-8d4bc4ba7749 // indirect
+	github.com/shurcooL/vfsgen v0.0.0-20200824052919-0d455de96546 // indirect
+	golang.org/x/net v0.0.0-20210813160813-60bc85c4be6d // indirect
+	golang.org/x/oauth2 v0.0.0-20210810183815-faf39c7919d5 // indirect
+	golang.org/x/time v0.0.0-20210723032227-1f47c861a9ac // indirect
+	google.golang.org/api v0.54.0 // indirect
+	google.golang.org/genproto v0.0.0-20210816143620-e15ff196659d // indirect
+	gopkg.in/alecthomas/kingpin.v2 v2.2.6 // indirect
+	gopkg.in/fsnotify/fsnotify.v1 v1.4.7 // indirect
+	gopkg.in/inf.v0 v0.9.1 // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
+	k8s.io/api v0.0.0-00010101000000-000000000000 // indirect
+	k8s.io/apimachinery v0.0.0-00010101000000-000000000000 // indirect
+	k8s.io/client-go v0.0.0-00010101000000-000000000000 // indirect
+)
