@@ -8,7 +8,40 @@ NOTE: As semantic versioning states all 0.y.z releases can contain breaking chan
 
 We use *breaking :warning:* to mark changes that are not backward compatible (relates only to v0.y.z releases.)
 
-## [v0.22.0](https://github.com/thanos-io/thanos/tree/release-0.22)
+## Unreleased
+
+## [v0.23.0](https://github.com/thanos-io/thanos/tree/release-0.23) - 2021.09.23
+
+### Added
+
+- [#4453](https://github.com/thanos-io/thanos/pull/4453) Tools `thanos bucket web`: Add flag `--selector.relabel-config-file` / `--selector.relabel-config` / `--max-time` / `--min-time` to filter served blocks.
+- [#4482](https://github.com/thanos-io/thanos/pull/4482) Store: Add `http_config` option for COS object store client.
+- [#4487](https://github.com/thanos-io/thanos/pull/4487) Query/Store: Add memcached auto discovery support for all caching clients.
+- [#4444](https://github.com/thanos-io/thanos/pull/4444) UI: Add search to the Block UI.
+- [#4509](https://github.com/thanos-io/thanos/pull/4509) Logging: Add `duration_ms` in int64 to the logs for easier log filtering.
+- [#4462](https://github.com/thanos-io/thanos/pull/4462) UI: Highlighting blocks overlap in the Block UI.
+- [#4469](https://github.com/thanos-io/thanos/pull/4469) Compact: Add flag `compact.skip-block-with-out-of-order-chunks` to skip blocks with out-of-order chunks during compaction instead of halting.
+- [#4506](https://github.com/thanos-io/thanos/pull/4506) Store: Add `Baidu BOS` object storage, see [documents](docs/storage.md#baidu-bos) for further information.
+- [#4552](https://github.com/thanos-io/thanos/pull/4552) Compact: Add `thanos_compact_downsample_duration_seconds` histogram metric.
+- [#4594](https://github.com/thanos-io/thanos/pull/4594) Reloader: Expose metrics in config reloader to give info on the last operation.
+- [#4619](https://github.com/thanos-io/thanos/pull/4619) Tracing: Added consistent tags to Series call from Querier about number important series statistics: `processed.series`, `processed.samples`, `processed.samples` and `processed.bytes`. This will give admin idea of how much data each component processes per query.
+- [#4623](https://github.com/thanos-io/thanos/pull/4623) Query-frontend: Make HTTP downstream tripper (client) configurable via parameters `--query-range.downstream-tripper-config` and `--query-range.downstream-tripper-config-file`. If your downstream URL is localhost or 127.0.0.1 then it is strongly recommended to bump `max_idle_conns_per_host` to at least 100 so that `query-frontend` could properly use HTTP keep-alive connections and thus reduce the latency of `query-frontend` by about 20%.
+
+### Fixed
+
+- [#4468](https://github.com/thanos-io/thanos/pull/4468) Rule: Fix temporary rule filename composition issue.
+- [#4476](https://github.com/thanos-io/thanos/pull/4476) UI: Fix incorrect html escape sequence used for '>' symbol.
+- [#4532](https://github.com/thanos-io/thanos/pull/4532) Mixin: Fix "all jobs" selector in thanos mixin dashboards.
+- [#4607](https://github.com/thanos-io/thanos/pull/4607) Azure: Fix Azure MSI Rate Limit.
+
+### Changed
+
+- [#4519](https://github.com/thanos-io/thanos/pull/4519) Query: Switch to miekgdns DNS resolver as the default one.
+- [#4586](https://github.com/thanos-io/thanos/pull/4586) Update Prometheus/Cortex dependencies and implement LabelNames() pushdown as a result; provides massive speed-up for the labels API in Thanos Query.
+- [#4421](https://github.com/thanos-io/thanos/pull/4421) *breaking :warning:*: `--store` (in the future, to be renamed to `--endpoints`) now supports passing any APIs from Thanos gRPC APIs: StoreAPI, MetadataAPI, RulesAPI, TargetsAPI and ExemplarsAPI (in oppose in the past you have to put it in hidden `--targets`, `--rules` etc flags). `--store` will now automatically detect what APIs server exposes.
+- [#4669](https://github.com/thanos-io/thanos/pull/4669) Moved Prometheus dependency to v2.30.
+
+## [v0.22.0](https://github.com/thanos-io/thanos/tree/release-0.22) - 2021.07.22
 
 ### Added
 
@@ -22,24 +55,18 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 - [#3970](https://github.com/thanos-io/thanos/pull/3970) Azure: Adds more configuration options for Azure blob storage. This allows for pipeline and reader specific configuration. Implements HTTP transport configuration options. These options allows for more fine-grained control on timeouts and retries. Implements MSI authentication as second method of authentication via a service principal token.
 - [#4406](https://github.com/thanos-io/thanos/pull/4406) Tools: Add retention command for applying retention policy on the bucket.
 - [#4430](https://github.com/thanos-io/thanos/pull/4430) Compact: Add flag `downsample.concurrency` to specify the concurrency of downsampling blocks.
-- [#4231](https://github.com/thanos-io/thanos/pull/4231) Receive: Implemented the [receive dual-mode](https://github.com/thanos-io/thanos/blob/release-0.22/docs/proposals-accepted/202012-receive-split.md). This means that it is now you can run receive as ingester (TSDB only, no hashring awareness), as router (no TSDB, only forwarding mode) and old mode (router + ingester) in one service. Consider splitting functionality if you want to scale your hashring into multiple rings or you want horizontally autoscale your ingester more often.
-- [#3678](https://github.com/thanos-io/thanos/pull/3678) UI: add support for new duration format in graph range input. Now it is possible to use composite durations such as `5m30s`.
 
 ### Fixed
 
 - [#4384](https://github.com/thanos-io/thanos/pull/4384) Fix the experimental PromQL editor when used on multiple line.
 - [#4342](https://github.com/thanos-io/thanos/pull/4342) ThanosSidecarUnhealthy doesn't fire if the sidecar is never healthy
 - [#4388](https://github.com/thanos-io/thanos/pull/4388) Receive: fix bug in forwarding remote-write requests within the hashring via gRPC when TLS is enabled on the HTTP server but not on the gRPC server.
-- [#4340](https://github.com/thanos-io/thanos/pull/4340) UI: now displays the duration and all annotations of an alert in the alerts page.
-- [#4348](https://github.com/thanos-io/thanos/pull/4348) Fixed parsing of the port in the log middleware.
-- [#4417](https://github.com/thanos-io/thanos/pull/4417) UI: fixed the night mode in Bucket UI.
 - [#4442](https://github.com/thanos-io/thanos/pull/4442) Ruler: fix SIGHUP reload signal not working.
 
 ### Changed
 
 - [#4354](https://github.com/thanos-io/thanos/pull/4354) Receive: use the S2 library for decoding Snappy data; saves about 5-7% of CPU time in the Receive component when handling incoming remote write requests
-- [#4369](https://github.com/thanos-io/thanos/pull/4354) Build: Pin upgrade Alpine's version.
-- [#4404](https://github.com/thanos-io/thanos/pull/4404) Receive: added extra validation for the tenant's label name. Some unsupported formats could have passed before.
+- [#4369](https://github.com/thanos-io/thanos/pull/4354) Build: do not upgrade apline version
 
 ## [v0.21.1](https://github.com/thanos-io/thanos/releases/tag/v0.21.1) - 2021.06.04
 
@@ -125,7 +152,7 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 - [#4085](https://github.com/thanos-io/thanos/pull/4085) Receive: Improved Performance for err path.
 - [#4094](https://github.com/thanos-io/thanos/pull/4094) *: Upgrade Prometheus & Alertmanager.
 
-## [v0.20.0](https://github.com/thanos-io/thanos/releases/tag/v0.20.0) - 2021.03.31
+## [v0.19.0](https://github.com/thanos-io/thanos/releases/tag/v0.19.0) - 2021.03.31
 
 - [#3700](https://github.com/thanos-io/thanos/pull/3700) Compact/Web: Make old bucket viewer UI work with vanilla Prometheus blocks.
 - [#3657](https://github.com/thanos-io/thanos/pull/3657) *: It's now possible to configure HTTP transport options for S3 client.
@@ -249,7 +276,7 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 
 Highlights:
 
-- New Thanos component, [Query Frontend](https://thanos.io/tip/components/query-frontend.md/) has more options and supports shared cache (currently: Memcached).
+- New Thanos component, [Query Frontend](docs/components/query-frontend.md) has more options and supports shared cache (currently: Memcached).
 - Added debug mode in Thanos UI that allows to filter Stores to query from by their IPs from Store page (!). This helps enormously in e.g debugging the slowest store etc. All raw Thanos API allows passing `storeMatch[]` arguments with `__address__` matchers.
 - Improved debuggability on all Thanos components by exposing [off-CPU profiles thanks to fgprof endpoint](https://github.com/felixge/fgprof).
 - Significantly improved sidecar latency and CPU usage for metrics fetches.
@@ -288,7 +315,7 @@ Highlights:
 
 Highlights:
 
-- Added new Thanos component: [Query Frontend](https://thanos.io/v0.15/components/query-frontend/) responsible for response caching, query scheduling and parallelization (based on Cortex Query Frontend).
+- Added new Thanos component: [Query Frontend](https://thanos.io/v0.15/components/query-frontend.md/) responsible for response caching, query scheduling and parallelization (based on Cortex Query Frontend).
 - Added various new, improved UIs to Thanos based on React: Querier BuildInfo & Flags, Ruler UI, BlockViewer.
 - Optimized Sidecar, Store, Receive, Ruler data retrieval with new TSDB ChunkIterator (capping chunks to 120 samples), which fixed various leaks.
 - Fixed sample limit on Store Gateway.
@@ -330,7 +357,7 @@ Highlights:
 - [#2973](https://github.com/thanos-io/thanos/pull/2973) Add Thanos Query Frontend component.
 - [#2980](https://github.com/thanos-io/thanos/pull/2980) Bucket Viewer: Migrate block viewer to React.
 - [#2725](https://github.com/thanos-io/thanos/pull/2725) Add bucket index operation durations: `thanos_bucket_store_cached_series_fetch_duration_seconds` and `thanos_bucket_store_cached_postings_fetch_duration_seconds`.
-- [#2931](https://github.com/thanos-io/thanos/pull/2931) Query: Allow passing a `storeMatch[]` to select matching stores when debugging the querier. See [documentation](https://thanos.io/tip/components/query.md/#store-filtering)
+- [#2931](https://github.com/thanos-io/thanos/pull/2931) Query: Allow passing a `storeMatch[]` to select matching stores when debugging the querier. See [documentation](docs/components/query.md#store-filtering)
 
 ### Changed
 
@@ -408,7 +435,7 @@ sse_config:
 ### Changed
 
 - [#2194](https://github.com/thanos-io/thanos/pull/2194) Updated to golang v1.14.2.
-- [#2505](https://github.com/thanos.io/thanos/pull/2505) Store: Removed obsolete `thanos_store_node_info` metric.
+- [#2505](https://github.com/thanos-io/thanos/pull/2505) Store: Removed obsolete `thanos_store_node_info` metric.
 - [#2513](https://github.com/thanos-io/thanos/pull/2513) Tools: Moved `thanos bucket` commands to `thanos tools bucket`, also moved `thanos check rules` to `thanos tools rules-check`. `thanos tools rules-check` also takes rules by `--rules` repeated flag not argument anymore.
 - [#2548](https://github.com/thanos-io/thanos/pull/2548/commits/53e69bd89b2b08c18df298eed7d90cb7179cc0ec) Store, Querier: remove duplicated chunks on StoreAPI.
 - [#2596](https://github.com/thanos-io/thanos/pull/2596) Updated Prometheus dependency to [@cd73b3d33e064bbd846fc7a26dc8c313d46af382](https://github.com/prometheus/prometheus/commit/cd73b3d33e064bbd846fc7a26dc8c313d46af382) which falls in between v2.17.0 and v2.18.0.
@@ -454,7 +481,7 @@ sse_config:
 
 ### Added
 
-- [#2252](https://github.com/thanos-io/thanos/pull/2252) Query: add new `--store-strict` flag. More information available [here](/docs/proposals/202001_thanos_query_health_handling.md).
+- [#2252](https://github.com/thanos-io/thanos/pull/2252) Query: add new `--store-strict` flag. More information available [here](docs/proposals-done/202001-thanos-query-health-handling.md).
 - [#2265](https://github.com/thanos-io/thanos/pull/2265) Compact: add `--wait-interval` to specify compaction wait interval between consecutive compact runs when `--wait` is enabled.
 - [#2250](https://github.com/thanos-io/thanos/pull/2250) Compact: enable vertical compaction for offline deduplication (experimental). Uses `--deduplication.replica-label` flag to specify the replica label on which to deduplicate (hidden). Please note that this uses a NAIVE algorithm for merging (no smart replica deduplication, just chaining samples together). This works well for deduplication of blocks with **precisely the same samples** like those produced by Receiver replication. We plan to add a smarter algorithm in the following weeks.
 - [#1714](https://github.com/thanos-io/thanos/pull/1714) Compact: the compact component now exposes the bucket web UI when it is run as a long-lived process.
@@ -493,7 +520,7 @@ sse_config:
 ### Added
 
 - [#2003](https://github.com/thanos-io/thanos/pull/2003) Query: Support downsampling for /series.
-- [#1952](https://github.com/thanos-io/thanos/pull/1952) Store Gateway: Implemented [binary index header](https://thanos.io/tip/proposals/201912_thanos_binary_index_header.md/). This significantly reduces resource consumption (memory, CPU, net bandwidth) for startup and data loading processes as well as baseline memory. This means that adding more blocks into object storage, without querying them will use almost no resources. This, however, **still means that querying large amounts of data** will result in high spikes of memory and CPU use as before, due to simply fetching large amounts of metrics data. Since we fixed baseline, we are now focusing on query performance optimizations in separate initiatives. To enable experimental `index-header` mode run store with hidden `experimental.enable-index-header` flag.
+- [#1952](https://github.com/thanos-io/thanos/pull/1952) Store Gateway: Implemented [binary index header](docs/proposals-done/201912-thanos-binary-index-header.md). This significantly reduces resource consumption (memory, CPU, net bandwidth) for startup and data loading processes as well as baseline memory. This means that adding more blocks into object storage, without querying them will use almost no resources. This, however, **still means that querying large amounts of data** will result in high spikes of memory and CPU use as before, due to simply fetching large amounts of metrics data. Since we fixed baseline, we are now focusing on query performance optimizations in separate initiatives. To enable experimental `index-header` mode run store with hidden `experimental.enable-index-header` flag.
 - [#2009](https://github.com/thanos-io/thanos/pull/2009) Store Gateway: Minimum age of all blocks before they are being read. Set it to a safe value (e.g 30m) if your object storage is eventually consistent. GCS and S3 are (roughly) strongly consistent.
 - [#1963](https://github.com/thanos-io/thanos/pull/1963) Mixin: Add Thanos Ruler alerts.
 - [#1984](https://github.com/thanos-io/thanos/pull/1984) Query: Add cache-control header to not cache on error.
@@ -842,7 +869,7 @@ This version moved tarballs to Golang 1.12.5 from 1.11 as well, so same warning 
 
 :warning: **IMPORTANT** :warning: This is the last release that supports gossip. From Thanos v0.5.0, gossip will be completely removed.
 
-This release also disables gossip mode by default for all components. See [this](docs/proposals/201809_gossip-removal.md) for more details.
+This release also disables gossip mode by default for all components. See [this](docs/proposals-done/201809-gossip-removal.md) for more details.
 
 :warning: This release moves Thanos docker images (NOT artifacts by accident) to Golang 1.12. This release includes change in GC's memory release which gives following effect:
 
@@ -995,7 +1022,7 @@ New Store tracing span: \* `store_query_gate_ismyturn` shows how long it took fo
 
 - Support for gzip compressed configuration files before envvar substitution for reloader package.
 - `bucket inspect` command for better insights on blocks in object storage.
-- Support for [Tencent COS](docs/storage.md#tencent-cos-configuration) object storage.
+- Support for [Tencent COS](docs/storage.md#tencent-cos) object storage.
 - Partial Response disable option for StoreAPI and QueryAPI.
 - Partial Response disable button on Thanos UI
 - We have initial docs for goDoc documentation!
@@ -1116,7 +1143,7 @@ Note lots of necessary breaking changes in flags that relates to bucket configur
 
 ## [v0.1.0](https://github.com/thanos-io/thanos/releases/tag/v0.1.0) - 2018.09.14
 
-Initial version to have a stable reference before [gossip protocol removal](/docs/proposals/201809_gossip-removal.md).
+Initial version to have a stable reference before [gossip protocol removal](docs/proposals-done/201809-gossip-removal.md).
 
 ### Added
 
