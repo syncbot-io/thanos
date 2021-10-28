@@ -1,12 +1,8 @@
 component: "Monitoring"
 
 reviewers:
-- kakkoyun
-- paulfantom
 - simonpasquier
-- squat
 - bwplotka
-- dgrisonnet
 - jan--f
 - slashpai
 - prashbnair
@@ -18,12 +14,8 @@ reviewers:
 - raptorsun
 
 approvers:
-- kakkoyun
-- paulfantom
 - simonpasquier
-- squat
 - bwplotka
-- dgrisonnet
 - jan--f
 - slashpai
 - prashbnair
@@ -35,6 +27,10 @@ approvers:
 - raptorsun
 
 emeritus_approvers:
+- paulfantom
+- dgrisonnet
+- squat
+- kakkoyun
 - metalmatze
 - lilic
 - brancz
