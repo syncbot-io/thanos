@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/cortexproject/cortex/integration/e2e"
-	"github.com/cortexproject/cortex/pkg/util"
+	"github.com/grafana/dskit/backoff"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
@@ -31,7 +31,7 @@ import (
 const infoLogLevel = "info"
 
 // Same as default for now.
-var defaultBackoffConfig = util.BackoffConfig{
+var defaultBackoffConfig = backoff.Config{
 	MinBackoff: 300 * time.Millisecond,
 	MaxBackoff: 600 * time.Millisecond,
 	MaxRetries: 50,
@@ -43,7 +43,7 @@ const (
 
 // TODO(bwplotka): Run against multiple?
 func DefaultPrometheusImage() string {
-	return "quay.io/prometheus/prometheus:v2.26.0"
+	return "quay.io/prometheus/prometheus:v2.29.2"
 }
 
 func DefaultAlertmanagerImage() string {
@@ -662,7 +662,14 @@ func NewMemcached(name string) *e2e.ConcreteService {
 	return memcached
 }
 
-func NewToolsBucketWeb(name string, bucketConfig client.BucketConfig, routePrefix, externalPrefix string) (*Service, error) {
+func NewToolsBucketWeb(
+	name string,
+	bucketConfig client.BucketConfig,
+	routePrefix,
+	externalPrefix string,
+	minTime string,
+	maxTime string,
+	relabelConfig string) (*Service, error) {
 	bktConfigBytes, err := yaml.Marshal(bucketConfig)
 	if err != nil {
 		return nil, errors.Wrapf(err, "generate tools bucket web config file: %v", bucketConfig)
@@ -680,6 +687,18 @@ func NewToolsBucketWeb(name string, bucketConfig client.BucketConfig, routePrefi
 
 	if externalPrefix != "" {
 		args = append(args, "--web.external-prefix="+externalPrefix)
+	}
+
+	if minTime != "" {
+		args = append(args, "--min-time="+minTime)
+	}
+
+	if maxTime != "" {
+		args = append(args, "--max-time="+maxTime)
+	}
+
+	if relabelConfig != "" {
+		args = append(args, "--selector.relabel-config="+relabelConfig)
 	}
 
 	args = append([]string{"bucket", "web"}, args...)
