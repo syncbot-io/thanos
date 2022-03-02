@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -24,7 +25,8 @@ import (
 )
 
 const (
-	dockerLocalSharedDir = "/shared"
+	dockerLocalSharedDir   = "/shared"
+	dockerMacOSGatewayAddr = "gateway.docker.internal"
 )
 
 var (
@@ -91,29 +93,34 @@ func NewDockerEnvironment(name string, opts ...EnvironmentOption) (*DockerEnviro
 		return nil, errors.Wrapf(err, "create docker network '%s'", name)
 	}
 
-	out, err := d.exec("docker", "network", "inspect", name).CombinedOutput()
-	if err != nil {
-		e.logger.Log(string(out))
-		d.Close()
-		return nil, errors.Wrapf(err, "inspect docker network '%s'", name)
+	switch runtime.GOOS {
+	case "darwin":
+		d.hostAddr = dockerMacOSGatewayAddr
+	default:
+		out, err := d.exec("docker", "network", "inspect", name).CombinedOutput()
+		if err != nil {
+			e.logger.Log(string(out))
+			d.Close()
+			return nil, errors.Wrapf(err, "inspect docker network '%s'", name)
+		}
+
+		var inspectDetails []struct {
+			IPAM struct {
+				Config []struct {
+					Gateway string `json:"Gateway"`
+				} `json:"Config"`
+			} `json:"IPAM"`
+		}
+		if err := json.Unmarshal(out, &inspectDetails); err != nil {
+			return nil, errors.Wrap(err, "unmarshall docker inspect details to obtain Gateway IP")
+		}
+
+		if len(inspectDetails) != 1 || len(inspectDetails[0].IPAM.Config) != 1 {
+			return nil, errors.Errorf("unexpected format of docker inspect; expected exactly one element in root and IPAM.Config, got %v", string(out))
+		}
+		d.hostAddr = inspectDetails[0].IPAM.Config[0].Gateway
 	}
 
-	var inspectDetails []struct {
-		IPAM struct {
-			Config []struct {
-				Gateway string `json:"Gateway"`
-			} `json:"Config"`
-		} `json:"IPAM"`
-	}
-	if err := json.Unmarshal(out, &inspectDetails); err != nil {
-		return nil, errors.Wrap(err, "unmarshall docker inspect details to obtain Gateway IP")
-	}
-
-	if len(inspectDetails) != 1 || len(inspectDetails[0].IPAM.Config) != 1 {
-		return nil, errors.Errorf("unexpected format of docker inspect; expected exactly one element in root and IPAM.Config, got %v", string(out))
-	}
-
-	d.hostAddr = inspectDetails[0].IPAM.Config[0].Gateway
 	return d, nil
 }
 
@@ -247,6 +254,11 @@ func (e *DockerEnvironment) buildDockerRunArgs(name string, ports map[string]int
 	if opts.Privileged {
 		args = append(args, "--privileged")
 	}
+
+	for _, c := range opts.Capabilities {
+		args = append(args, "--cap-add", string(c))
+	}
+
 	// Published ports.
 	for _, port := range ports {
 		args = append(args, "-p", strconv.Itoa(port))
@@ -272,9 +284,10 @@ type dockerRunnable struct {
 	name  string
 	ports map[string]int
 
-	logger      Logger
-	opts        StartOptions
-	waitBackoff *backoff.Backoff
+	logger              Logger
+	opts                StartOptions
+	waitBackoffReady    *backoff.Backoff
+	waitBackoffDownload *backoff.Backoff
 
 	// usedNetworkName is docker NetworkName used to start this container.
 	// If empty it means container is stopped.
@@ -307,8 +320,17 @@ func (d *dockerRunnable) Init(opts StartOptions) Runnable {
 		}
 	}
 
+	if opts.WaitDownloadBackoff == nil {
+		opts.WaitDownloadBackoff = &backoff.Config{
+			Min:        500 * time.Millisecond,
+			Max:        1 * time.Second,
+			MaxRetries: 100,
+		}
+	}
+
 	d.opts = opts
-	d.waitBackoff = backoff.New(context.Background(), *opts.WaitReadyBackoff)
+	d.waitBackoffReady = backoff.New(context.Background(), *opts.WaitReadyBackoff)
+	d.waitBackoffDownload = backoff.New(context.Background(), *opts.WaitDownloadBackoff)
 	return d
 }
 
@@ -367,6 +389,11 @@ func (d *dockerRunnable) Start() (err error) {
 		return err
 	}
 	d.usedNetworkName = d.env.networkName
+
+	// Make sure the image is available locally; if not wait for it to download.
+	if err = d.waitForImageDownload(); err != nil {
+		return err
+	}
 
 	// Wait until the container has been started.
 	if err = d.waitForRunning(); err != nil {
@@ -507,7 +534,7 @@ func (d *dockerRunnable) waitForRunning() (err error) {
 	}
 
 	var out []byte
-	for d.waitBackoff.Reset(); d.waitBackoff.Ongoing(); {
+	for d.waitBackoffReady.Reset(); d.waitBackoffReady.Ongoing(); {
 		// Enforce a timeout on the command execution because we've seen some flaky tests
 		// stuck here.
 
@@ -521,20 +548,20 @@ func (d *dockerRunnable) waitForRunning() (err error) {
 			d.containerName(),
 		).CombinedOutput()
 		if err != nil {
-			d.waitBackoff.Wait()
+			d.waitBackoffReady.Wait()
 			continue
 		}
 
 		if out == nil {
 			err = errors.Errorf("nil output")
-			d.waitBackoff.Wait()
+			d.waitBackoffReady.Wait()
 			continue
 		}
 
 		str := strings.TrimSpace(string(out))
 		if str != "true" {
 			err = errors.Errorf("unexpected output: %q", str)
-			d.waitBackoff.Wait()
+			d.waitBackoffReady.Wait()
 			continue
 		}
 
@@ -547,18 +574,44 @@ func (d *dockerRunnable) waitForRunning() (err error) {
 	return errors.Wrapf(err, "docker container %s failed to start", d.Name())
 }
 
+func (d *dockerRunnable) waitForImageDownload() (err error) {
+	if !d.IsRunning() {
+		return errors.Errorf("service %s is stopped", d.Name())
+	}
+
+	for d.waitBackoffDownload.Reset(); d.waitBackoffDownload.Ongoing(); {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err = d.env.execContext(
+			ctx,
+			"docker",
+			"image",
+			"inspect",
+			d.opts.Image,
+		).CombinedOutput()
+		if err != nil {
+			d.waitBackoffDownload.Wait()
+			continue
+		}
+
+		return nil
+	}
+
+	return errors.Wrapf(err, "docker image %s failed to download", d.opts.Image)
+}
+
 func (d *dockerRunnable) WaitReady() (err error) {
 	if !d.IsRunning() {
 		return errors.Errorf("service %s is stopped", d.Name())
 	}
 
-	for d.waitBackoff.Reset(); d.waitBackoff.Ongoing(); {
+	for d.waitBackoffReady.Reset(); d.waitBackoffReady.Ongoing(); {
 		err = d.Ready()
 		if err == nil {
 			return nil
 		}
 
-		d.waitBackoff.Wait()
+		d.waitBackoffReady.Wait()
 	}
 	return errors.Wrapf(err, "the service %s is not ready", d.Name())
 }

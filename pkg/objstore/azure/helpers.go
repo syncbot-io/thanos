@@ -15,9 +15,10 @@ import (
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	blob "github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/go-autorest/autorest/adal"
 	"github.com/Azure/go-autorest/autorest/azure/auth"
-	"github.com/go-kit/kit/log"
-	"github.com/go-kit/kit/log/level"
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
 )
 
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
@@ -37,11 +38,8 @@ func init() {
 }
 
 func getAzureStorageCredentials(logger log.Logger, conf Config) (blob.Credential, error) {
-	if conf.MSIResource != "" {
-		msiConfig := auth.NewMSIConfig()
-		msiConfig.Resource = conf.MSIResource
-
-		spt, err := msiConfig.ServicePrincipalToken()
+	if conf.MSIResource != "" || conf.UserAssignedID != "" {
+		spt, err := getServicePrincipalToken(logger, conf)
 		if err != nil {
 			return nil, err
 		}
@@ -68,6 +66,26 @@ func getAzureStorageCredentials(logger log.Logger, conf Config) (blob.Credential
 	return credential, nil
 }
 
+func getServicePrincipalToken(logger log.Logger, conf Config) (*adal.ServicePrincipalToken, error) {
+	resource := conf.MSIResource
+	if resource == "" {
+		resource = fmt.Sprintf("https://%s.%s", conf.StorageAccountName, conf.Endpoint)
+	}
+
+	msiConfig := auth.MSIConfig{
+		Resource: resource,
+	}
+
+	if conf.UserAssignedID != "" {
+		level.Debug(logger).Log("msg", "using user assigned identity", "clientId", conf.UserAssignedID)
+		msiConfig.ClientID = conf.UserAssignedID
+	} else {
+		level.Debug(logger).Log("msg", "using system assigned identity")
+	}
+
+	return msiConfig.ServicePrincipalToken()
+}
+
 func getContainerURL(ctx context.Context, logger log.Logger, conf Config) (blob.ContainerURL, error) {
 	credentials, err := getAzureStorageCredentials(logger, conf)
 
@@ -86,6 +104,10 @@ func getContainerURL(ctx context.Context, logger log.Logger, conf Config) (blob.
 		retryOptions.TryTimeout = time.Until(deadline)
 	}
 
+	client := http.Client{
+		Transport: DefaultTransport(conf),
+	}
+
 	p := blob.NewPipeline(credentials, blob.PipelineOptions{
 		Retry:     retryOptions,
 		Telemetry: blob.TelemetryOptions{Value: "Thanos"},
@@ -99,10 +121,6 @@ func getContainerURL(ctx context.Context, logger log.Logger, conf Config) (blob.
 		},
 		HTTPSender: pipeline.FactoryFunc(func(next pipeline.Policy, po *pipeline.PolicyOptions) pipeline.PolicyFunc {
 			return func(ctx context.Context, request pipeline.Request) (pipeline.Response, error) {
-				client := http.Client{
-					Transport: DefaultTransport(conf),
-				}
-
 				resp, err := client.Do(request.WithContext(ctx))
 
 				return pipeline.NewHTTPResponse(resp), err

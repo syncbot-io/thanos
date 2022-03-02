@@ -43,7 +43,7 @@ Current object storage client implementations:
 | [AWS/S3](#s3) (and all S3-compatible storages e.g disk-based [Minio](https://min.io/)) | Stable             | Production Usage      | yes               | @bwplotka               |
 | [Azure Storage Account](#azure)                                                        | Stable             | Production Usage      | no                | @vglafirov              |
 | [OpenStack Swift](#openstack-swift)                                                    | Beta (working PoC) | Production Usage      | yes               | @FUSAKLA                |
-| [Tencent COS](#tencent-cos)                                                            | Beta               | Production Usage      | no                | @jojohappy              |
+| [Tencent COS](#tencent-cos)                                                            | Beta               | Production Usage      | no                | @jojohappy,@hanjm       |
 | [AliYun OSS](#aliyun-oss)                                                              | Beta               | Production Usage      | no                | @shaulboozhiao,@wujinhu |
 | [Local Filesystem](#filesystem)                                                        | Stable             | Testing and Demo only | yes               | @bwplotka               |
 
@@ -88,6 +88,7 @@ config:
     kms_key_id: ""
     kms_encryption_context: {}
     encryption_key: ""
+  sts_endpoint: ""
 ```
 
 At a minimum, you will need to provide a value for the `bucket`, `endpoint`, `access_key`, and `secret_key` keys. The rest of the keys are optional.
@@ -226,6 +227,12 @@ With this policy you should be able to run set `THANOS_TEST_OBJSTORE_SKIP=GCS,AZ
 
 Details about AWS policies: https://docs.aws.amazon.com/AmazonS3/latest/dev/using-with-s3-actions.html
 
+##### STS Endpoint
+
+If you want to use IAM credential retrieved from an instance profile, Thanos needs to authenticate through AWS STS. For this purposes you can specify your own STS Endpoint.
+
+By default Thanos will use endpoint: https://sts.amazonaws.com and AWS region coresponding endpoints.
+
 #### GCS
 
 To configure Google Cloud Storage bucket as an object store you need to set `bucket` with GCS bucket name and configure Google Application credentials.
@@ -314,6 +321,7 @@ config:
   endpoint: ""
   max_retries: 0
   msi_resource: ""
+  user_assigned_id: ""
   pipeline_config:
     max_tries: 0
     try_timeout: 0s
@@ -333,7 +341,11 @@ config:
     disable_compression: false
 ```
 
-If `msi_resource` is used, authentication is done via ServicePrincipalToken. The value for Azure should be `https://<storage-account-name>.blob.core.windows.net`. The generic `max_retries` will be used as value for the `pipeline_config`'s `max_tries` and `reader_config`'s `max_retry_requests`. For more control, `max_retries` could be ignored (0) and one could set specific retry values.
+If `msi_resource` is used, authentication is done via system-assigned managed identity. The value for Azure should be `https://<storage-account-name>.blob.core.windows.net`.
+
+If `user_assigned_id` is used, authentication is done via user-assigned managed identity. When using `user_assigned_id` the `msi_resource` defaults to `https://<storage_account>.<endpoint>`
+
+The generic `max_retries` will be used as value for the `pipeline_config`'s `max_tries` and `reader_config`'s `max_retry_requests`. For more control, `max_retries` could be ignored (0) and one could set specific retry values.
 
 #### OpenStack Swift
 

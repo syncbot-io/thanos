@@ -29,20 +29,21 @@ import (
 	"time"
 
 	cortexutil "github.com/cortexproject/cortex/pkg/util"
-	"github.com/go-kit/kit/log"
+	"github.com/go-kit/log"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/pkg/labels"
-	"github.com/prometheus/prometheus/pkg/timestamp"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 
 	"github.com/prometheus/prometheus/util/stats"
+
 	"github.com/thanos-io/thanos/pkg/api"
 	"github.com/thanos-io/thanos/pkg/exemplars"
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
@@ -93,8 +94,8 @@ type QueryAPI struct {
 	enableExemplarPartialResponse       bool
 	disableCORS                         bool
 
-	replicaLabels []string
-	endpointSet   *query.EndpointSet
+	replicaLabels  []string
+	endpointStatus func() []query.EndpointStatus
 
 	defaultRangeQueryStep                  time.Duration
 	defaultInstantQueryMaxSourceResolution time.Duration
@@ -106,7 +107,7 @@ type QueryAPI struct {
 // NewQueryAPI returns an initialized QueryAPI type.
 func NewQueryAPI(
 	logger log.Logger,
-	endpointSet *query.EndpointSet,
+	endpointStatus func() []query.EndpointStatus,
 	qe func(int64) *promql.Engine,
 	c query.QueryableCreator,
 	ruleGroups rules.UnaryClient,
@@ -118,6 +119,7 @@ func NewQueryAPI(
 	enableRulePartialResponse bool,
 	enableTargetPartialResponse bool,
 	enableMetricMetadataPartialResponse bool,
+	enableExemplarPartialResponse bool,
 	replicaLabels []string,
 	flagsMap map[string]string,
 	defaultRangeQueryStep time.Duration,
@@ -143,8 +145,9 @@ func NewQueryAPI(
 		enableRulePartialResponse:              enableRulePartialResponse,
 		enableTargetPartialResponse:            enableTargetPartialResponse,
 		enableMetricMetadataPartialResponse:    enableMetricMetadataPartialResponse,
+		enableExemplarPartialResponse:          enableExemplarPartialResponse,
 		replicaLabels:                          replicaLabels,
-		endpointSet:                            endpointSet,
+		endpointStatus:                         endpointStatus,
 		defaultRangeQueryStep:                  defaultRangeQueryStep,
 		defaultInstantQueryMaxSourceResolution: defaultInstantQueryMaxSourceResolution,
 		defaultMetadataTimeRange:               defaultMetadataTimeRange,
@@ -713,7 +716,11 @@ func (qapi *QueryAPI) labelNames(r *http.Request) (interface{}, []error, *api.Ap
 
 func (qapi *QueryAPI) stores(_ *http.Request) (interface{}, []error, *api.ApiError) {
 	statuses := make(map[string][]query.EndpointStatus)
-	for _, status := range qapi.endpointSet.GetEndpointStatus() {
+	for _, status := range qapi.endpointStatus() {
+		// Don't consider an endpoint if we cannot retrieve component type.
+		if status.ComponentType == nil {
+			continue
+		}
 		statuses[status.ComponentType.String()] = append(statuses[status.ComponentType.String()], status)
 	}
 	return statuses, nil, nil

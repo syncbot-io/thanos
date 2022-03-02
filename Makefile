@@ -11,13 +11,13 @@ arch = $(shell uname -m)
 # Run `DOCKER_CLI_EXPERIMENTAL=enabled docker manifest inspect quay.io/prometheus/busybox:latest` to get SHA or
 # just visit https://quay.io/repository/prometheus/busybox?tag=latest&tab=tags.
 # TODO(bwplotka): Pinning is important but somehow quay kills the old images, so make sure to update regularly.
-# Update at 2021.6.07
+# Update at 2021.12.15
 ifeq ($(arch), x86_64)
     # amd64
-    BASE_DOCKER_SHA="de4af55df1f648a334e16437c550a2907e0aed4f0b0edf454b0b215a9349bdbb"
+    BASE_DOCKER_SHA="768a51a5f71827471e6e58f0d6200c2fa24f2cb5cde1ecbd67fe28f93d4ef464"
 else ifeq ($(arch), armv8)
     # arm64
-    BASE_DOCKER_SHA="5591971699f6cf8abf6776495385e9d62751111a8cba56bf4946cf1d0de425ed"
+    BASE_DOCKER_SHA="042d6195e1793b226d1632117cccb4c4906c8ab393b8b68328ad43cf59c64f9d"
 else
     echo >&2 "only support amd64 or arm64 arch" && exit 1
 endif
@@ -237,7 +237,7 @@ test-e2e: docker
 	@echo ">> cleaning docker environment."
 	@docker system prune -f --volumes
 	@echo ">> cleaning e2e test garbage."
-	@rm -rf ./test/e2e/e2e_integration_test*
+	@rm -rf ./test/e2e/e2e_*
 	@echo ">> running /test/e2e tests."
 	# NOTE(bwplotka):
 	# * If you see errors on CI (timeouts), but not locally, try to add -parallel 1 to limit to single CPU to reproduce small 1CPU machine.
@@ -363,7 +363,7 @@ jsonnet-format: $(JSONNETFMT)
 		xargs -n 1 -- $(JSONNETFMT_CMD) -i
 
 .PHONY: jsonnet-lint
-jsonnet-lint: $(JSONNET_LINT) ${JSONNET_VENDOR_DIR}
+jsonnet-lint: $(JSONNET_LINT) jsonnet-vendor
 	find . -name 'vendor' -prune -o -name '*.libsonnet' -print -o -name '*.jsonnet' -print | \
 		xargs -n 1 -- $(JSONNET_LINT) -J ${JSONNET_VENDOR_DIR}
 
@@ -399,4 +399,3 @@ $(PROTOC):
 	@echo ">> installing protoc@${PROTOC_VERSION}"
 	@mv -- "$(TMP_GOPATH)/bin/protoc" "$(GOBIN)/protoc-$(PROTOC_VERSION)"
 	@echo ">> produced $(GOBIN)/protoc-$(PROTOC_VERSION)"
-
