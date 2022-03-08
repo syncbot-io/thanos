@@ -13,7 +13,6 @@ data/
 test/e2e/e2e_integration_test*
 
 # Ignore promu artifacts.
-/.build
 /.release
 /.tarballs
 
