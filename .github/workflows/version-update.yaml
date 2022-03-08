@@ -17,8 +17,7 @@ jobs:
           scope: arajkumar
       - name: Trigger Version Bump workflow
         run: |
-          echo "${{ steps.version-bump.outputs.token }}" > .githubtoken
-          gh auth login --with-token < .githubtoken
-          rm .githubtoken
-          gh workflow run update-cmo-deps-versions.yaml -f name=hello --repo arajkumar/syncbot
-
+         curl -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ steps.version-bump.outputs.token }}" \
+            --request POST \
+            https://api.github.com/repos/arajkumar/syncbot/actions/workflows/update-cmo-deps-versions.yaml/dispatches -d '{"ref":"main"}'
