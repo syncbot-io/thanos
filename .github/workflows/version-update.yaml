@@ -6,5 +6,6 @@ jobs:
   deploy:
     runs-on: ubuntu-18.04
     steps:
-      - uses: actions/checkout@v2
+      - name: Trigger Version Bump workflow
+        run: gh workflow run update-cmo-deps-versions.yaml -f name=hello
 
