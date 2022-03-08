@@ -7,5 +7,9 @@ jobs:
     runs-on: ubuntu-18.04
     steps:
       - name: Trigger Version Bump workflow
-        run: gh workflow run update-cmo-deps-versions.yaml -f name=hello
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" > .githubtoken
+          gh auth login --with-token < .githubtoken
+          rm .githubtoken
+          gh workflow run update-cmo-deps-versions.yaml -f name=hello
 
