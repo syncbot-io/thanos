@@ -13,12 +13,10 @@ import (
 	"testing"
 	"time"
 
-	e2edb "github.com/cortexproject/cortex/integration/e2e/db"
 	"github.com/efficientgo/e2e"
 	"github.com/prometheus/prometheus/model/labels"
 
 	"github.com/thanos-io/thanos/pkg/objstore/client"
-	"github.com/thanos-io/thanos/pkg/objstore/s3"
 	"github.com/thanos-io/thanos/pkg/query"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
@@ -32,31 +30,27 @@ func TestInfo(t *testing.T) {
 	testutil.Ok(t, err)
 	t.Cleanup(e2ethanos.CleanScenario(t, e))
 
-	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone1", defaultPromConfig("prom-alone1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage())
+	prom1, sidecar1, err := e2ethanos.NewPrometheusWithSidecar(e, "alone1", defaultPromConfig("prom-alone1", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "alone2", defaultPromConfig("prom-alone2", 0, "", ""), "", e2ethanos.DefaultPrometheusImage())
+	prom2, sidecar2, err := e2ethanos.NewPrometheusWithSidecar(e, "alone2", defaultPromConfig("prom-alone2", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
-	prom3, sidecar3, err := e2ethanos.NewPrometheusWithSidecar(e, "alone3", defaultPromConfig("prom-alone3", 0, "", ""), "", e2ethanos.DefaultPrometheusImage())
+	prom3, sidecar3, err := e2ethanos.NewPrometheusWithSidecar(e, "alone3", defaultPromConfig("prom-alone3", 0, "", ""), "", e2ethanos.DefaultPrometheusImage(), "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(prom1, sidecar1, prom2, sidecar2, prom3, sidecar3))
 
 	const bucket = "info-api-test"
-	m := e2ethanos.NewMinio(e, "thanos-minio", bucket)
+	m, err := e2ethanos.NewMinio(e, "thanos-minio", bucket)
+	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(m))
 	store, err := e2ethanos.NewStoreGW(
 		e,
 		"1",
 		client.BucketConfig{
-			Type: client.S3,
-			Config: s3.Config{
-				Bucket:    bucket,
-				AccessKey: e2edb.MinioAccessKey,
-				SecretKey: e2edb.MinioSecretKey,
-				Endpoint:  m.InternalEndpoint("http"),
-				Insecure:  true,
-			},
+			Type:   client.S3,
+			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("https"), e2ethanos.ContainerSharedDir),
 		},
 		"",
+		nil,
 	)
 	testutil.Ok(t, err)
 	testutil.Ok(t, e2e.StartAndWaitReady(store))

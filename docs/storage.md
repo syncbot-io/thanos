@@ -65,6 +65,7 @@ config:
   bucket: ""
   endpoint: ""
   region: ""
+  aws_sdk_auth: false
   access_key: ""
   insecure: false
   signature_version2: false
@@ -79,6 +80,12 @@ config:
     max_idle_conns: 100
     max_idle_conns_per_host: 100
     max_conns_per_host: 0
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
   trace:
     enable: false
   list_objects_version: ""
@@ -93,6 +100,8 @@ config:
 
 At a minimum, you will need to provide a value for the `bucket`, `endpoint`, `access_key`, and `secret_key` keys. The rest of the keys are optional.
 
+However if you set `aws_sdk_auth: true` Thanos will use the default authentication methods of the AWS SDK for go based on [known environment variables](https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html) (`AWS_PROFILE`, `AWS_WEB_IDENTITY_TOKEN_FILE` ... etc) and known AWS config files (~/.aws/config). If you turn this on, then the `bucket` and `endpoint` are the required config keys.
+
 The AWS region to endpoint mapping can be found in this [link](https://docs.aws.amazon.com/general/latest/gr/s3.html).
 
 Make sure you use a correct signature version. Currently AWS requires signature v4, so it needs `signature_version2: false`. If you don't specify it, you will get an `Access Denied` error. On the other hand, several S3 compatible APIs use `signature_version2: true`.
@@ -104,6 +113,8 @@ Please refer to the documentation of [the Transport type](https://golang.org/pkg
 `part_size` is specified in bytes and refers to the minimum file size used for multipart uploads, as some custom S3 implementations may have different requirements. A value of `0` means to use a default 128 MiB size.
 
 Set `list_objects_version: "v1"` for S3 compatible APIs that don't support ListObjectsV2 (e.g. some versions of Ceph). Default value (`""`) is equivalent to `"v2"`.
+
+`http_config.tls_config` allows configuring TLS connections. Please refer to the document of [tls_config](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#tls_config) for detailed information on what each option does.
 
 For debug and testing purposes you can set
 
@@ -339,6 +350,12 @@ config:
     max_idle_conns_per_host: 0
     max_conns_per_host: 0
     disable_compression: false
+    tls_config:
+      ca_file: ""
+      cert_file: ""
+      key_file: ""
+      server_name: ""
+      insecure_skip_verify: false
 ```
 
 If `msi_resource` is used, authentication is done via system-assigned managed identity. The value for Azure should be `https://<storage-account-name>.blob.core.windows.net`.
@@ -393,6 +410,7 @@ config:
   bucket: ""
   region: ""
   app_id: ""
+  endpoint: ""
   secret_key: ""
   secret_id: ""
   http_config:
@@ -404,6 +422,10 @@ config:
     max_idle_conns_per_host: 100
     max_conns_per_host: 0
 ```
+
+The `secret_key` and `secret_id` field is required. The `http_config` field is optional for optimize HTTP transport settings. There are two ways to configure the required bucket information:
+1. Provide the values of `bucket`, `region` and `app_id` keys.
+2. Provide the values of `endpoint` key with url format when you want to specify vpc internal endpoint. Please refer to the document of [endpoint](https://intl.cloud.tencent.com/document/product/436/6224) for more detail.
 
 Set the flags `--objstore.config-file` to reference to the configuration file.
 

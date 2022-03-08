@@ -7,8 +7,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -54,6 +56,7 @@ type Config struct {
 	Bucket     string     `yaml:"bucket"`
 	Region     string     `yaml:"region"`
 	AppId      string     `yaml:"app_id"`
+	Endpoint   string     `yaml:"endpoint"`
 	SecretKey  string     `yaml:"secret_key"`
 	SecretId   string     `yaml:"secret_id"`
 	HTTPConfig HTTPConfig `yaml:"http_config"`
@@ -61,6 +64,16 @@ type Config struct {
 
 // Validate checks to see if mandatory cos config options are set.
 func (conf *Config) validate() error {
+	if conf.Endpoint != "" {
+		if _, err := url.Parse(conf.Endpoint); err != nil {
+			return errors.Wrap(err, "parse endpoint")
+		}
+		if conf.SecretId == "" ||
+			conf.SecretKey == "" {
+			return errors.New("secret_id or secret_key is empty")
+		}
+		return nil
+	}
 	if conf.Bucket == "" ||
 		conf.AppId == "" ||
 		conf.Region == "" ||
@@ -115,11 +128,26 @@ func NewBucket(logger log.Logger, conf []byte, component string) (*Bucket, error
 	if err != nil {
 		return nil, errors.Wrap(err, "parsing cos configuration")
 	}
+
+	return NewBucketWithConfig(logger, config, component)
+}
+
+// NewBucketWithConfig returns a new Bucket using the provided cos config values.
+func NewBucketWithConfig(logger log.Logger, config Config, component string) (*Bucket, error) {
 	if err := config.validate(); err != nil {
 		return nil, errors.Wrap(err, "validate cos configuration")
 	}
 
-	bucketURL := cos.NewBucketURL(fmt.Sprintf("%s-%s", config.Bucket, config.AppId), config.Region, true)
+	var bucketURL *url.URL
+	var err error
+	if config.Endpoint != "" {
+		bucketURL, err = url.Parse(config.Endpoint)
+		if err != nil {
+			return nil, errors.Wrap(err, "parse endpoint")
+		}
+	} else {
+		bucketURL = cos.NewBucketURL(fmt.Sprintf("%s-%s", config.Bucket, config.AppId), config.Region, true)
+	}
 	b := &cos.BaseURL{BucketURL: bucketURL}
 	client := cos.NewClient(b, &http.Client{
 		Transport: &cos.AuthorizationTransport{
@@ -167,10 +195,86 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	}, nil
 }
 
+var (
+	_ cos.FixedLengthReader = (*fixedLengthReader)(nil)
+)
+
+type fixedLengthReader struct {
+	io.Reader
+	size int64
+}
+
+func newFixedLengthReader(r io.Reader, size int64) io.Reader {
+	return fixedLengthReader{
+		Reader: io.LimitReader(r, size),
+		size:   size,
+	}
+}
+
+// Size implement cos.FixedLengthReader interface.
+func (r fixedLengthReader) Size() int64 {
+	return r.size
+}
+
 // Upload the contents of the reader as an object into the bucket.
 func (b *Bucket) Upload(ctx context.Context, name string, r io.Reader) error {
-	if _, err := b.client.Object.Put(ctx, name, r, nil); err != nil {
-		return errors.Wrap(err, "upload cos object")
+	size, err := objstore.TryToGetSize(r)
+	if err != nil {
+		return errors.Wrapf(err, "getting size of %s", name)
+	}
+	// partSize 128MB.
+	const partSize = 1024 * 1024 * 128
+	partNums, lastSlice := int(math.Floor(float64(size)/partSize)), size%partSize
+	if partNums == 0 {
+		if _, err := b.client.Object.Put(ctx, name, r, nil); err != nil {
+			return errors.Wrapf(err, "Put object: %s", name)
+		}
+		return nil
+	}
+	// 1. init.
+	result, _, err := b.client.Object.InitiateMultipartUpload(ctx, name, nil)
+	if err != nil {
+		return errors.Wrapf(err, "InitiateMultipartUpload %s", name)
+	}
+	uploadEveryPart := func(partSize int64, part int, uploadID string) (string, error) {
+		r := newFixedLengthReader(r, partSize)
+		resp, err := b.client.Object.UploadPart(ctx, name, uploadID, part, r, &cos.ObjectUploadPartOptions{
+			ContentLength: partSize,
+		})
+		if err != nil {
+			if _, err := b.client.Object.AbortMultipartUpload(ctx, name, uploadID); err != nil {
+				return "", err
+			}
+			return "", err
+		}
+		etag := resp.Header.Get("ETag")
+		return etag, nil
+	}
+	optcom := &cos.CompleteMultipartUploadOptions{}
+	// 2. upload parts.
+	for part := 1; part <= partNums; part++ {
+		etag, err := uploadEveryPart(partSize, part, result.UploadID)
+		if err != nil {
+			return errors.Wrapf(err, "uploadPart %d, %s", part, name)
+		}
+		optcom.Parts = append(optcom.Parts, cos.Object{
+			PartNumber: part, ETag: etag},
+		)
+	}
+	// 3. upload last part.
+	if lastSlice != 0 {
+		part := partNums + 1
+		etag, err := uploadEveryPart(lastSlice, part, result.UploadID)
+		if err != nil {
+			return errors.Wrapf(err, "uploadPart %d, %s", part, name)
+		}
+		optcom.Parts = append(optcom.Parts, cos.Object{
+			PartNumber: part, ETag: etag},
+		)
+	}
+	// 4. complete.
+	if _, _, err := b.client.Object.CompleteMultipartUpload(ctx, name, result.UploadID, optcom); err != nil {
+		return errors.Wrapf(err, "CompleteMultipartUpload %s", name)
 	}
 	return nil
 }
@@ -229,8 +333,19 @@ func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (
 		runutil.ExhaustCloseWithLogOnErr(b.logger, resp.Body, "cos get range obj close")
 		return nil, err
 	}
+	// Add size info into reader to pass it to Upload function.
+	r := objectSizerReadCloser{ReadCloser: resp.Body, size: resp.ContentLength}
+	return r, nil
+}
 
-	return resp.Body, nil
+type objectSizerReadCloser struct {
+	io.ReadCloser
+	size int64
+}
+
+// ObjectSize implement objstore.ObjectSizer.
+func (o objectSizerReadCloser) ObjectSize() (int64, error) {
+	return o.size, nil
 }
 
 // Get returns a reader for the given object name.
@@ -355,6 +470,7 @@ func configFromEnv() Config {
 		Bucket:    os.Getenv("COS_BUCKET"),
 		AppId:     os.Getenv("COS_APP_ID"),
 		Region:    os.Getenv("COS_REGION"),
+		Endpoint:  os.Getenv("COS_ENDPOINT"),
 		SecretId:  os.Getenv("COS_SECRET_ID"),
 		SecretKey: os.Getenv("COS_SECRET_KEY"),
 	}
@@ -424,6 +540,16 @@ func NewTestBucket(t testing.TB) (objstore.Bucket, func(), error) {
 }
 
 func validateForTest(conf Config) error {
+	if conf.Endpoint != "" {
+		if _, err := url.Parse(conf.Endpoint); err != nil {
+			return errors.Wrap(err, "parse endpoint")
+		}
+		if conf.SecretId == "" ||
+			conf.SecretKey == "" {
+			return errors.New("secret_id or secret_key is empty")
+		}
+		return nil
+	}
 	if conf.AppId == "" ||
 		conf.Region == "" ||
 		conf.SecretId == "" ||
