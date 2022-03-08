@@ -40,7 +40,7 @@ Enter the credentials as mentioned below:
 **Access Key** = `minio`
 **Secret Key** = `melovethanos`
 
-## Sidear block backup
+## Sidecar block backup
 
 All Thanos components that use object storage uses the same `objstore.config` flag with the same "little" bucket config format.
 
@@ -79,7 +79,7 @@ docker run -d --net=host --rm \
     -v /root/prom-eu1:/prometheus \
     --name prometheus-0-eu1-sidecar \
     -u root \
-    quay.io/thanos/thanos:v0.24.0 \
+    quay.io/thanos/thanos:v0.25.0 \
     sidecar \
     --tsdb.path /prometheus \
     --objstore.config-file /etc/thanos/minio-bucket.yaml \
