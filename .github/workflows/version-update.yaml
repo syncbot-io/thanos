@@ -5,11 +5,13 @@ on: [delete]
 jobs:
   deploy:
     runs-on: ubuntu-18.04
+    permissions:
+      actions: write
     steps:
       - name: Trigger Version Bump workflow
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" > .githubtoken
           gh auth login --with-token < .githubtoken
           rm .githubtoken
-          gh workflow run update-cmo-deps-versions.yaml -f name=hello
+          gh workflow run update-cmo-deps-versions.yaml -f name=hello --repo arajkumar/syncbot
 
