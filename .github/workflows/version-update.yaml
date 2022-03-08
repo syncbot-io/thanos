@@ -8,9 +8,16 @@ jobs:
     permissions:
       actions: write
     steps:
+      - name: Get auth token to push to ${{ inputs.sandbox }}
+        id: version-bump
+        uses: getsentry/action-github-app-token@v1
+        with:
+          app_id: ${{ secrets.VERSION_BUMP_APP_ID }}
+          private_key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
+          scope: arajkumar/syncbot
       - name: Trigger Version Bump workflow
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" > .githubtoken
+          echo "${{ steps.version-bump.outputs.token }}" > .githubtoken
           gh auth login --with-token < .githubtoken
           rm .githubtoken
           gh workflow run update-cmo-deps-versions.yaml -f name=hello --repo arajkumar/syncbot
