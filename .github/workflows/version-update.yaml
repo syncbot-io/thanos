@@ -14,7 +14,7 @@ jobs:
         with:
           app_id: ${{ secrets.VERSION_BUMP_APP_ID }}
           private_key: ${{ secrets.VERSION_BUMP_APP_PRIVATE_KEY }}
-          scope: arajkumar/syncbot
+          scope: arajkumar
       - name: Trigger Version Bump workflow
         run: |
           echo "${{ steps.version-bump.outputs.token }}" > .githubtoken
