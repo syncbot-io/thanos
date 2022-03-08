@@ -17,6 +17,7 @@ import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/oklog/ulid"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -31,6 +32,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 type ResolutionLevel int64
@@ -121,9 +123,9 @@ func UntilNextDownsampling(m *metadata.Meta) (time.Duration, error) {
 	case downsample.ResLevel2:
 		return time.Duration(0), errors.New("no downsampling")
 	case downsample.ResLevel1:
-		return time.Duration(downsample.DownsampleRange1*time.Millisecond) - timeRange, nil
+		return time.Duration(downsample.ResLevel2DownsampleRange*time.Millisecond) - timeRange, nil
 	case downsample.ResLevel0:
-		return time.Duration(downsample.DownsampleRange0*time.Millisecond) - timeRange, nil
+		return time.Duration(downsample.ResLevel1DownsampleRange*time.Millisecond) - timeRange, nil
 	default:
 		panic(errors.Errorf("invalid resolution %v", m.Thanos.Downsample.Resolution))
 	}
@@ -216,16 +218,6 @@ type Grouper interface {
 	Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Group, err error)
 }
 
-// DefaultGroupKey returns a unique identifier for the group the block belongs to, based on
-// the DefaultGrouper logic. It considers the downsampling resolution and the block's labels.
-func DefaultGroupKey(meta metadata.Thanos) string {
-	return defaultGroupKey(meta.Downsample.Resolution, labels.FromMap(meta.Labels))
-}
-
-func defaultGroupKey(res int64, lbls labels.Labels) string {
-	return fmt.Sprintf("%d@%v", res, lbls.Hash())
-}
-
 // DefaultGrouper is the Thanos built-in grouper. It groups blocks based on downsample
 // resolution and block's labels.
 type DefaultGrouper struct {
@@ -293,7 +285,7 @@ func NewDefaultGrouper(
 func (g *DefaultGrouper) Groups(blocks map[ulid.ULID]*metadata.Meta) (res []*Group, err error) {
 	groups := map[string]*Group{}
 	for _, m := range blocks {
-		groupKey := DefaultGroupKey(m.Thanos)
+		groupKey := m.Thanos.GroupKey()
 		group, ok := groups[groupKey]
 		if !ok {
 			lbls := labels.FromMap(m.Thanos.Labels)
@@ -635,7 +627,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 					continue
 				}
 
-				if m.MaxTime-m.MinTime < downsample.DownsampleRange0 {
+				if m.MaxTime-m.MinTime < downsample.ResLevel1DownsampleRange {
 					continue
 				}
 				groupBlocks[group.key]++
@@ -651,7 +643,7 @@ func (ds *DownsampleProgressCalculator) ProgressCalculate(ctx context.Context, g
 					continue
 				}
 
-				if m.MaxTime-m.MinTime < downsample.DownsampleRange1 {
+				if m.MaxTime-m.MinTime < downsample.ResLevel2DownsampleRange {
 					continue
 				}
 				groupBlocks[group.key]++
@@ -764,7 +756,11 @@ func (cg *Group) Compact(ctx context.Context, dir string, planner Planner, comp 
 		return false, ulid.ULID{}, errors.Wrap(err, "create compaction group dir")
 	}
 
-	shouldRerun, compID, err := cg.compact(ctx, subDir, planner, comp)
+	var err error
+	tracing.DoInSpanWithErr(ctx, "compaction_group", func(ctx context.Context) error {
+		shouldRerun, compID, err = cg.compact(ctx, subDir, planner, comp)
+		return err
+	}, opentracing.Tags{"group.key": cg.Key()})
 	if err != nil {
 		cg.compactionFailures.Inc()
 		return false, ulid.ULID{}, err
@@ -980,7 +976,11 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 		overlappingBlocks = true
 	}
 
-	toCompact, err := planner.Plan(ctx, cg.metasByMinTime)
+	var toCompact []*metadata.Meta
+	tracing.DoInSpanWithErr(ctx, "compaction_planning", func(ctx context.Context) error {
+		toCompact, err = planner.Plan(ctx, cg.metasByMinTime)
+		return err
+	})
 	if err != nil {
 		return false, ulid.ULID{}, errors.Wrap(err, "plan compaction")
 	}
@@ -1008,12 +1008,20 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 			uniqueSources[s] = struct{}{}
 		}
 
-		if err := block.Download(ctx, cg.logger, cg.bkt, meta.ULID, bdir); err != nil {
+		tracing.DoInSpanWithErr(ctx, "compaction_block_download", func(ctx context.Context) error {
+			err = block.Download(ctx, cg.logger, cg.bkt, meta.ULID, bdir)
+			return err
+		}, opentracing.Tags{"block.id": meta.ULID})
+		if err != nil {
 			return false, ulid.ULID{}, retry(errors.Wrapf(err, "download block %s", meta.ULID))
 		}
 
 		// Ensure all input blocks are valid.
-		stats, err := block.GatherIndexHealthStats(cg.logger, filepath.Join(bdir, block.IndexFilename), meta.MinTime, meta.MaxTime)
+		var stats block.HealthStats
+		tracing.DoInSpanWithErr(ctx, "compaction_block_health_stats", func(ctx context.Context) error {
+			stats, err = block.GatherIndexHealthStats(cg.logger, filepath.Join(bdir, block.IndexFilename), meta.MinTime, meta.MaxTime)
+			return err
+		}, opentracing.Tags{"block.id": meta.ULID})
 		if err != nil {
 			return false, ulid.ULID{}, errors.Wrapf(err, "gather index issues for block %s", bdir)
 		}
@@ -1039,7 +1047,10 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 	level.Info(cg.logger).Log("msg", "downloaded and verified blocks; compacting blocks", "plan", fmt.Sprintf("%v", toCompactDirs), "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
 
 	begin = time.Now()
-	compID, err = comp.Compact(dir, toCompactDirs, nil)
+	tracing.DoInSpanWithErr(ctx, "compaction", func(ctx context.Context) error {
+		compID, err = comp.Compact(dir, toCompactDirs, nil)
+		return err
+	})
 	if err != nil {
 		return false, ulid.ULID{}, halt(errors.Wrapf(err, "compact blocks %v", toCompactDirs))
 	}
@@ -1081,7 +1092,11 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 	}
 
 	// Ensure the output block is valid.
-	if err := block.VerifyIndex(cg.logger, index, newMeta.MinTime, newMeta.MaxTime); !cg.acceptMalformedIndex && err != nil {
+	tracing.DoInSpanWithErr(ctx, "compaction_verify_index", func(ctx context.Context) error {
+		err = block.VerifyIndex(cg.logger, index, newMeta.MinTime, newMeta.MaxTime)
+		return err
+	})
+	if !cg.acceptMalformedIndex && err != nil {
 		return false, ulid.ULID{}, halt(errors.Wrapf(err, "invalid result block %s", bdir))
 	}
 
@@ -1095,7 +1110,11 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 
 	begin = time.Now()
 
-	if err := block.Upload(ctx, cg.logger, cg.bkt, bdir, cg.hashFunc); err != nil {
+	tracing.DoInSpanWithErr(ctx, "compaction_block_upload", func(ctx context.Context) error {
+		err = block.Upload(ctx, cg.logger, cg.bkt, bdir, cg.hashFunc)
+		return err
+	})
+	if err != nil {
 		return false, ulid.ULID{}, retry(errors.Wrapf(err, "upload of %s failed", compID))
 	}
 	level.Info(cg.logger).Log("msg", "uploaded block", "result_block", compID, "duration", time.Since(begin), "duration_ms", time.Since(begin).Milliseconds())
@@ -1104,7 +1123,11 @@ func (cg *Group) compact(ctx context.Context, dir string, planner Planner, comp 
 	// into the next planning cycle.
 	// Eventually the block we just uploaded should get synced into the group again (including sync-delay).
 	for _, meta := range toCompact {
-		if err := cg.deleteBlock(meta.ULID, filepath.Join(dir, meta.ULID.String())); err != nil {
+		tracing.DoInSpanWithErr(ctx, "compaction_block_delete", func(ctx context.Context) error {
+			err = cg.deleteBlock(meta.ULID, filepath.Join(dir, meta.ULID.String()))
+			return err
+		}, opentracing.Tags{"block.id": meta.ULID})
+		if err != nil {
 			return false, ulid.ULID{}, retry(errors.Wrapf(err, "mark old block for deletion from bucket"))
 		}
 		cg.groupGarbageCollectedBlocks.Inc()
@@ -1337,7 +1360,7 @@ func (f *GatherNoCompactionMarkFilter) NoCompactMarkedBlocks() map[ulid.ULID]*me
 }
 
 // Filter passes all metas, while gathering no compact markers.
-func (f *GatherNoCompactionMarkFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec) error {
+func (f *GatherNoCompactionMarkFilter) Filter(ctx context.Context, metas map[ulid.ULID]*metadata.Meta, synced *extprom.TxGaugeVec, modified *extprom.TxGaugeVec) error {
 	f.noCompactMarkedMap = make(map[ulid.ULID]*metadata.NoCompactMark)
 
 	// Make a copy of block IDs to check, in order to avoid concurrency issues
