@@ -1,0 +1,10 @@
+name: Version Bump
+
+on: [delete]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+
